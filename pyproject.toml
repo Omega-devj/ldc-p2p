@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ldc-p2p"
+version = "2.0.0a1"
+description = "LDC P2P - messagerie P2P hybride chiffrée de bout en bout pour Windows"
+requires-python = ">=3.11"
+dependencies = ["PySide6-Essentials>=6.6", "qasync>=0.27", "PyNaCl>=1.5", "cryptography>=42"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+build = ["pyinstaller>=6"]
+
+[project.scripts]
+ldc-p2p = "ldc_p2p.app:main"
+ldc-p2p-server = "ldc_p2p.server.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

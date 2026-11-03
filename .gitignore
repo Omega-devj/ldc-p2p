@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+# Données utilisateur : ne JAMAIS les versionner
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.ldckey
+*.ldcbackup
+profiles/
+.venv/
