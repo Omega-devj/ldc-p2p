@@ -32,6 +32,7 @@ MAX_TEXT = 8000
 MAX_AGE_MS = 14 * 86400 * 1000        # au-delà : échec définitif (récupérable manuellement)
 RESEND_AFTER_MS = 12 * 3600 * 1000    # message accepté par le serveur mais jamais acquitté
 MAX_PENDING_REQUESTS = 100
+ALLOWED_REACTIONS = ("👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉")
 SEEN_RETENTION_MS = 30 * 86400 * 1000
 
 
@@ -92,15 +93,10 @@ class ChatEngine:
     async def start(self) -> None:
         s = self.settings
         if s.direct_enabled:
-            self.direct = DirectManager(self.identity, self._link_lookup, self._on_link_env, "0.0.0.0", s.listen_port)
-            try:
-                await self.direct.start()
-            except OSError as e:
-                log.warning("Écoute directe impossible: %s", e)
-                self.direct = None
+            await self._start_direct()
         if s.server_host:
             self.relay = RelayClient(self.identity, s.server_host, s.server_port, tls=s.server_tls,
-                                     visible=s.status != "invisible", on_deliver=self._on_relay_env,
+                                     visible=s.status != "invisible", token=s.server_token, on_deliver=self._on_relay_env,
                                      on_presence=self._on_server_presence, on_state=self._on_relay_state)
             self.relay.start()
         self.spawn(self._outbox_loop(), "outbox")
@@ -110,6 +106,29 @@ class ChatEngine:
 
     def _resume_extensions(self) -> None:
         pass
+
+    async def _start_direct(self) -> None:
+        s = self.settings
+        self.direct = DirectManager(self.identity, self._link_lookup, self._on_link_env, "0.0.0.0", s.listen_port)
+        try:
+            await self.direct.start()
+        except OSError as e:
+            log.warning("Écoute directe impossible: %s", e)
+            self.direct = None
+
+    async def set_direct_enabled(self, enabled: bool) -> None:
+        """Applique immédiatement le réglage des connexions directes (sans redémarrage)."""
+        self.settings.direct_enabled = enabled
+        self.settings.save(self.db)
+        if enabled and self.direct is None:
+            await self._start_direct()
+            for c in self.db.list_contacts({"accepted"}):
+                if self.server_online.get(c["id"]):
+                    self.spawn(self._on_contact_online(c["id"]), "contact-online")
+        elif not enabled and self.direct is not None:
+            d, self.direct = self.direct, None
+            await d.stop()
+        self.events.emit("presence", id=None)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -134,7 +153,7 @@ class ChatEngine:
         s = self.settings
         if s.server_host and not self._stopping:
             self.relay = RelayClient(self.identity, s.server_host, s.server_port, tls=s.server_tls,
-                                     visible=s.status != "invisible", on_deliver=self._on_relay_env,
+                                     visible=s.status != "invisible", token=s.server_token, on_deliver=self._on_relay_env,
                                      on_presence=self._on_server_presence, on_state=self._on_relay_state)
             self.relay.start()
         else:
@@ -196,6 +215,13 @@ class ChatEngine:
         await self._queue_request(pub, greeting)
         self.events.emit("contact_update", id=pub.id)
         return dict(self.db.get_contact(pub.id))
+
+    def request_status(self, contact_id: str) -> str:
+        """'offline' (en attente de connexion au serveur), 'queued' (en cours d'envoi), 'sent' (remise au serveur)."""
+        row = self.db.conn.execute("SELECT 1 FROM outbox WHERE to_id=? AND kind='req' AND state='queued'", (contact_id,)).fetchone()
+        if row is None:
+            return "sent"
+        return "queued" if (self.relay and self.relay.connected) else "offline"
 
     async def request_contact(self, contact_id: str, greeting: str = "") -> None:
         """Transforme un membre de groupe en contact direct."""
@@ -397,13 +423,15 @@ class ChatEngine:
     def _msg_extra_inner(self, conv: str) -> dict:
         return {}
 
-    async def send_text(self, conv: str, text: str, reply_to: str | None = None) -> str:
+    async def send_text(self, conv: str, text: str, reply_to: str | None = None, mentions: list[str] | None = None) -> str:
         text = (text or "").strip()
         if not text:
             raise EngineError("Message vide")
         if len(text) > MAX_TEXT:
             raise EngineError(f"Message trop long (maximum {MAX_TEXT} caractères)")
-        return self._send_message(conv, "text", text, extra=None, reply_to=reply_to)
+        men = [m for m in dict.fromkeys(mentions or []) if ID_RE.match(m)][:20]
+        return self._send_message(conv, "text", text, extra={"men": men} if men else None, reply_to=reply_to,
+                                  inner_extra={"men": men} if men else None)
 
     def _send_message(self, conv: str, kind: str, body: str, extra: dict | None, reply_to: str | None = None,
                       mid: str | None = None, inner_extra: dict | None = None) -> str:
@@ -447,7 +475,9 @@ class ChatEngine:
             raise EngineError("Seuls vos messages texte peuvent être modifiés.")
         if not new_text or len(new_text) > MAX_TEXT:
             raise EngineError("Texte invalide")
-        self.db.update_message(mid, body=new_text, extra={"edited": now_ms()})
+        extra = dict(m["extra"]) if isinstance(m["extra"], dict) else {}
+        extra["edited"] = now_ms()
+        self.db.update_message(mid, body=new_text, extra=extra)
         for peer in self.db.receipts(mid):
             try:
                 self._enqueue(peer, {"t": "edit", "m": mid, "text": new_text}, kind="ctl")
@@ -455,6 +485,54 @@ class ChatEngine:
                 pass
         self.events.emit("message_updated", mid=mid, conv=m["conv"])
         self.events.emit("conversation_update", conv=m["conv"])
+
+    # ------------------------------------------------------------------ réactions
+    def _can_react(self, m: dict | None, peer: str) -> bool:
+        if not m or m["kind"] == "system":
+            return False
+        if m["conv"].startswith("grp:"):
+            g = self.db.get_group(m["conv"][4:])
+            return bool(g and peer in g["members"])
+        return m["conv"] == peer
+
+    async def react(self, mid: str, emoji: str) -> None:
+        """Ajoute, remplace ou retire (même emoji une 2ᵉ fois) la réaction de l'utilisateur."""
+        if emoji not in ALLOWED_REACTIONS:
+            raise EngineError("Réaction non disponible")
+        m = self.db.get_message(mid)
+        if not m or m["kind"] == "system":
+            raise EngineError("Message introuvable")
+        current = self.db.reactions_for([mid]).get(mid, {})
+        mine = next((e for e, who in current.items() if self.me in who), None)
+        new = "" if mine == emoji else emoji
+        self.db.set_reaction(mid, self.me, new or None)
+        for peer in self._conv_recipients(m["conv"]):
+            self._enqueue(peer, {"t": "react", "m": mid, "e": new}, kind="ctl")
+        self.events.emit("message_updated", mid=mid, conv=m["conv"])
+
+    def _on_reaction(self, sender: str, inner: dict) -> None:
+        mid, e = inner.get("m"), inner.get("e")
+        if not isinstance(mid, str) or not isinstance(e, str) or (e and e not in ALLOWED_REACTIONS):
+            return
+        m = self.db.get_message(mid)
+        if self._can_react(m, sender):
+            self.db.set_reaction(mid, sender, e or None)
+            self.events.emit("message_updated", mid=mid, conv=m["conv"])
+
+    # ------------------------------------------------------------------ noms ressemblants
+    def lookalikes(self, contact_id: str, name: str | None = None) -> list[dict]:
+        """Autres contacts portant le même nom (usurpation visuelle possible : les identifiants, eux, diffèrent)."""
+        c = self.db.get_contact(contact_id)
+        n = (name if name is not None else (c["name"] if c else "")).casefold().strip()
+        return [o for o in self.db.list_contacts() if o["id"] != contact_id and o["state"] != "blocked"
+                and n and (o["name"].casefold().strip() == n or (o["alias"] or "").casefold().strip() == n)]
+
+    def preview_card(self, code: str) -> tuple[PublicIdentity, list[dict]]:
+        try:
+            pub, _ = parse_card(decode_card(code))
+        except e2e.CardError as e:
+            raise EngineError(str(e)) from e
+        return pub, self.lookalikes(pub.id, pub.name)
 
     async def send_typing(self, conv: str) -> None:
         if not self.settings.typing_indicators or self.settings.status == "invisible":
@@ -525,7 +603,7 @@ class ChatEngine:
             return True
         t = inner["t"]
         state = contact["state"]
-        allowed = {"accepted": None, "pending_out": {"req_ok"}, "group": {"msg", "ginv", "gleave", "typing", "ack", "read", "fget", "fno", "fack", "fchunk", "fdone"}}
+        allowed = {"accepted": None, "pending_out": {"req_ok"}, "group": {"msg", "ginv", "gleave", "typing", "ack", "read", "react"}}
         if state in allowed and allowed[state] is not None and t not in allowed[state]:
             return True
         if state == "pending_in":
@@ -620,12 +698,16 @@ class ChatEngine:
                 self.events.emit("presence", id=sender)
         elif t == "cand":
             self.spawn(self._try_direct(sender, inner.get("a")), "direct")
+        elif t == "react":
+            self._on_reaction(sender, inner)
         elif t == "edit":
             m = self.db.get_message(str(inner.get("m")))
             text = inner.get("text")
             if (m and m["sender"] == sender and m["direction"] == "in" and m["kind"] == "text"
                     and isinstance(text, str) and 0 < len(text) <= MAX_TEXT):
-                self.db.update_message(m["mid"], body=text, extra={"edited": now_ms()})
+                extra = dict(m["extra"]) if isinstance(m["extra"], dict) else {}
+                extra["edited"] = now_ms()
+                self.db.update_message(m["mid"], body=text, extra=extra)
                 self.events.emit("message_updated", mid=m["mid"], conv=m["conv"])
                 self.events.emit("conversation_update", conv=m["conv"])
         elif t == "del":
@@ -657,6 +739,9 @@ class ChatEngine:
         ttl = inner.get("ttl") if isinstance(inner.get("ttl"), int) and 0 <= inner["ttl"] <= 30 * 86400 else 0
         reply = inner.get("reply") if isinstance(inner.get("reply"), str) else None
         extra = inner.get("x") if isinstance(inner.get("x"), dict) else None
+        men = [m for m in (inner.get("men") if isinstance(inner.get("men"), list) else []) if isinstance(m, str) and ID_RE.match(m)][:20]
+        if men and kind == "text":
+            extra = {"men": men}
         ts = min(env["ts"], now_ms())  # un horodatage futur n'est pas honoré
         fresh = self.db.add_message(mid=env["id"], conv=conv, sender=sender, direction="in", body=text, ts=ts,
                                     status="received", kind=kind, extra=extra, reply_to=reply, ttl=ttl)

@@ -103,7 +103,7 @@ class FilesMixin(ChatEngine):
 
     async def _dispatch_ext(self, sender: str, contact: Any, env: dict, inner: dict) -> None:
         t = inner["t"]
-        if t not in ("fget", "fno", "fack", "fchunk", "fdone"):
+        if t not in ("fget", "fno", "fack", "fchunk", "fdone", "fcancel"):
             return await super()._dispatch_ext(sender, contact, env, inner)
         fid = inner.get("f")
         tr = self.db.get_transfer(fid) if isinstance(fid, str) else None
@@ -128,6 +128,8 @@ class FilesMixin(ChatEngine):
             ok = bool(inner.get("ok"))
             self.db.update_transfer(fid, state="done" if ok else "failed")
             self.events.emit("file_state", mid=tr["mid"], state="done" if ok else "failed")
+        elif t == "fcancel":
+            self._apply_cancel(tr)
         elif t == "fchunk" and tr["direction"] == "in":
             await self._on_chunk(tr, inner)
 
@@ -219,6 +221,25 @@ class FilesMixin(ChatEngine):
         self.db.update_transfer(tr["fid"], state="receiving", path=str(part))
         self._enqueue(tr["peer"], {"t": "fget", "f": tr["fid"], "i": tr["next_idx"]}, kind="ctl")
         self.events.emit("file_state", mid=mid, state="receiving")
+
+    def _apply_cancel(self, tr: dict) -> None:
+        self._stop_stream(tr["fid"])
+        if tr["direction"] == "in" and tr.get("path"):
+            Path(tr["path"]).unlink(missing_ok=True) if tr["state"] != "done" else None
+        if tr["state"] in ("offered", "sending", "receiving", "paused"):
+            self.db.update_transfer(tr["fid"], state="cancelled")
+            self.events.emit("file_state", mid=tr["mid"], state="cancelled")
+
+    async def cancel_file(self, mid: str) -> None:
+        """Annule un transfert en cours ou en pause (émetteur ou destinataire) ; l'autre côté est prévenu."""
+        tr = self.db.get_transfer(mid)
+        if not tr or tr["state"] not in ("offered", "sending", "receiving", "paused"):
+            raise EngineError("Aucun transfert à annuler")
+        self._apply_cancel(tr)
+        try:
+            self._enqueue(tr["peer"], {"t": "fcancel", "f": tr["fid"]}, kind="ctl")
+        except EngineError:
+            pass
 
     async def decline_file(self, mid: str) -> None:
         tr = self.db.get_transfer(mid)

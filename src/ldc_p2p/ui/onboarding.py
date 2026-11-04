@@ -173,7 +173,7 @@ class OnboardingWindow(AuroraBackground):
         self.s_port = QSpinBox()
         self.s_port.setRange(1, 65535)
         self.s_port.setValue(9443)
-        self.s_tls = Switch(True)
+        self.s_tls = Switch(False)  # le serveur local par défaut n'a pas de TLS
         row.addWidget(label("Port"))
         row.addWidget(self.s_port)
         row.addStretch(1)
@@ -182,6 +182,15 @@ class OnboardingWindow(AuroraBackground):
         l.addWidget(self.s_host)
         l.addLayout(row)
         l.addWidget(label("Sans serveur, seules les connexions directes sur le même réseau local fonctionnent.", "faint", wrap=True))
+        self.s_token = QLineEdit()
+        self.s_token.setEchoMode(QLineEdit.Password)
+        self.s_token.setPlaceholderText("Jeton d'accès (seulement si le serveur est privé)")
+        l.addWidget(self.s_token)
+        test = button("Tester la connexion", "", "wifi")
+        self.s_result = label("", "muted", wrap=True)
+        test.clicked.connect(self._test_server)
+        l.addWidget(test, 0, Qt.AlignLeft)
+        l.addWidget(self.s_result)
         go = button("Terminer", "primary")
         go.setMinimumHeight(44)
         go.clicked.connect(self._finish_new)
@@ -189,8 +198,22 @@ class OnboardingWindow(AuroraBackground):
         l.addStretch(1)
         return w
 
+    def _test_server(self) -> None:
+        import asyncio
+        from ..network.errors import probe_server
+        self.s_result.setText("Test en cours…")
+        self.s_result.setProperty("role", "muted")
+
+        async def run() -> None:
+            r = await probe_server(self.s_host.text().strip(), self.s_port.value(), self.s_tls.isChecked(), self.s_token.text())
+            self.s_result.setText(("✓ " if r.ok else "✗ ") + r.message)
+            self.s_result.setProperty("role", "ok" if r.ok else "error")
+            self.s_result.style().unpolish(self.s_result)
+            self.s_result.style().polish(self.s_result)
+        asyncio.ensure_future(run())
+
     def _finish_new(self) -> None:
-        cfg = {"host": self.s_host.text().strip(), "port": self.s_port.value(), "tls": self.s_tls.isChecked()}
+        cfg = {"host": self.s_host.text().strip(), "port": self.s_port.value(), "tls": self.s_tls.isChecked(), "token": self.s_token.text()}
         p, self._new = self._new, None
         if p:
             self.profile_ready.emit(p, cfg)

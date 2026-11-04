@@ -19,15 +19,17 @@ class AuroraBackground(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         w, h = self.width(), self.height()
+        light = theme.is_light()
         if self.opaque:
             g = QLinearGradient(0, 0, w, h)
-            g.setColorAt(0, QColor("#0B0A14"))
-            g.setColorAt(1, QColor("#07070C"))
+            g.setColorAt(0, QColor("#F3F4FB" if light else "#0B0A14"))
+            g.setColorAt(1, QColor("#E3E6F3" if light else "#07070C"))
             p.fillRect(self.rect(), g)
-        for cx, cy, r, col in ((0.12, 0.05, 0.75, QColor(124, 58, 237, 78)),
-                               (0.92, 0.95, 0.70, QColor(79, 70, 229, 58)),
-                               (0.55, 1.05, 0.55, QColor(34, 211, 238, 20)),
-                               (0.95, 0.10, 0.40, QColor(236, 72, 153, 22))):
+        k = 0.55 if light else 1.0
+        for cx, cy, r, col in ((0.12, 0.05, 0.75, theme.accent(0, int(78 * k))),
+                               (0.92, 0.95, 0.70, theme.accent(2, int(58 * k))),
+                               (0.55, 1.05, 0.55, QColor(34, 211, 238, int(20 * k))),
+                               (0.95, 0.10, 0.40, QColor(236, 72, 153, int(22 * k)))):
             rg = QRadialGradient(QPointF(w * cx, h * cy), max(w, h) * r)
             c0, c1 = QColor(col), QColor(col)
             c1.setAlpha(0)
@@ -51,15 +53,21 @@ class GlassPanel(QFrame):
         path = QPainterPath()
         path.addRoundedRect(r, self.radius, self.radius)
         fill = QLinearGradient(r.topLeft(), r.bottomLeft())
-        a1, a2 = (30, 14) if self.strong else (20, 9)
-        fill.setColorAt(0, QColor(255, 255, 255, a1))
-        fill.setColorAt(1, QColor(255, 255, 255, a2))
+        a1, a2 = theme.glass_fill_alphas(self.strong)
+        base = (255, 255, 255)
+        fill.setColorAt(0, QColor(*base, a1))
+        fill.setColorAt(1, QColor(*base, a2))
         p.fillPath(path, fill)
         if self.border:
             edge = QLinearGradient(r.topLeft(), r.bottomRight())
-            edge.setColorAt(0, QColor(255, 255, 255, 70))
-            edge.setColorAt(0.5, QColor(255, 255, 255, 20))
-            edge.setColorAt(1, QColor(167, 139, 250, 40))
+            if theme.is_light():
+                edge.setColorAt(0, QColor(255, 255, 255, 230))
+                edge.setColorAt(0.5, QColor(20, 20, 60, 28))
+                edge.setColorAt(1, theme.accent(0, 55))
+            else:
+                edge.setColorAt(0, QColor(255, 255, 255, 70))
+                edge.setColorAt(0.5, QColor(255, 255, 255, 20))
+                edge.setColorAt(1, theme.accent(1, 40))
             p.setPen(QPen(QBrush(edge), 1))
             p.drawPath(path)
 
@@ -182,12 +190,12 @@ class Switch(QAbstractButton):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         r = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        off, on = QColor(255, 255, 255, 36), QColor("#8B5CF6")
+        off, on = theme.ov(60 if theme.is_light() else 36), theme.accent(0)
         t = self._pos
         col = QColor(int(off.red() + (on.red() - off.red()) * t), int(off.green() + (on.green() - off.green()) * t),
                      int(off.blue() + (on.blue() - off.blue()) * t), int(off.alpha() + (on.alpha() - off.alpha()) * t))
-        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
-        p.setBrush(col if self.isEnabled() else QColor(255, 255, 255, 18))
+        p.setPen(QPen(theme.ov(40), 1))
+        p.setBrush(col if self.isEnabled() else theme.ov(18))
         p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
         d = r.height() - 6
         x = r.left() + 3 + (r.width() - d - 6) * t
@@ -215,7 +223,7 @@ class Toast(GlassPanel):
         self._timer.timeout.connect(self.hide)
 
     def show_message(self, text: str, kind: str = "info", ms: int = 3500) -> None:
-        color = {"info": "#A78BFA", "ok": "#34D399", "error": "#F87171"}.get(kind, "#A78BFA")
+        color = {"info": theme.accent_hex(1), "ok": "#34D399", "error": "#F87171"}.get(kind, theme.accent_hex(1))
         name = {"info": "info", "ok": "check", "error": "alert"}.get(kind, "info")
         self.ico.setPixmap(icons.pixmap(name, color, 20))
         self.lbl.setText(text)

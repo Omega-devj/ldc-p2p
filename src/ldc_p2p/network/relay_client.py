@@ -19,7 +19,7 @@ class ChannelUnavailable(Exception):
 
 class RelayClient:
     def __init__(self, identity: Identity, host: str, port: int, *, tls: bool = False,
-                 ssl_ctx: ssl.SSLContext | None = None, visible: bool = True,
+                 ssl_ctx: ssl.SSLContext | None = None, visible: bool = True, token: str = "",
                  on_deliver: Callable[[dict], Awaitable[bool]] | None = None,
                  on_presence: Callable[[dict], None] | None = None,
                  on_state: Callable[[str, dict], None] | None = None,
@@ -28,6 +28,7 @@ class RelayClient:
         self.tls = tls
         self._ssl_ctx = ssl_ctx
         self.visible = visible
+        self.token = token
         self.on_deliver, self.on_presence, self.on_state = on_deliver, on_presence, on_state
         self.ping_interval, self.backoff_max = ping_interval, backoff_max
         self.state = "disconnected"
@@ -119,10 +120,11 @@ class RelayClient:
             await write_frame(writer, {
                 "t": "auth", "id": self.identity.id, "sk": b64(pub.sign_pk), "bk": b64(pub.box_pk),
                 "sig": b64(self.identity.sign(b"ldc-auth-v1\0" + challenge + self.identity.id.encode())),
-                "visible": self.visible})
+                "visible": self.visible, **({"tok": self.token} if self.token else {})})
             ready = await asyncio.wait_for(read_frame(reader, 8192), 10)
             if ready["t"] != "ready":
-                raise ConnectionError("authentification refusée par le serveur")
+                reason = ready.get("reason", "")
+                raise ConnectionError("accès refusé par le serveur (jeton d'accès ou liste d'invités)" if reason == "denied" else "authentification refusée par le serveur")
             self.observed_ip = ready.get("observed_ip")
             self.last_error = None
             self._set_state("connected", observed_ip=self.observed_ip, queued=ready.get("queued", 0))

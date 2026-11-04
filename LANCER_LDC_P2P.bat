@@ -5,8 +5,7 @@ where python >nul 2>nul || (echo Python 3.11 ou plus recent est requis : https:/
 if not exist .venv (
   echo Premiere installation, patientez...
   python -m venv .venv || (pause & exit /b 1)
-  .venv\Scripts\python -m pip install --quiet --upgrade pip
-  .venv\Scripts\pip install --quiet -r requirements.txt || (echo Echec de l'installation & pause & exit /b 1)
 )
+.venv\Scripts\python -m pip install --quiet --disable-pip-version-check -r requirements.txt || (echo Echec de l'installation & pause & exit /b 1)
 set PYTHONPATH=%~dp0src
 start "" .venv\Scripts\pythonw.exe -m ldc_p2p %*

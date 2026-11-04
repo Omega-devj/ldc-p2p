@@ -4,9 +4,11 @@ from __future__ import annotations
 import html
 import re
 from datetime import date, datetime
+from pathlib import Path
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QAbstractTextDocumentLayout, QBrush, QColor, QCursor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen,
+from PySide6.QtCore import (QAbstractListModel, QModelIndex, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal)
+from PySide6.QtGui import (QAbstractTextDocumentLayout, QBrush, QColor, QFont, QFontMetrics, QGuiApplication, QImageReader,
+                           QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QTextCursor,
                            QTextDocument)
 from PySide6.QtWidgets import QAbstractItemView, QListView, QStyledItemDelegate, QStyleOptionViewItem
 
@@ -14,18 +16,39 @@ from .. import icons, theme
 
 ITEM_ROLE = Qt.UserRole + 1
 _URL = re.compile(r"(https?://[^\s<>\"']+)", re.IGNORECASE)
+IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+THUMB_MAX = (280, 200)
 
 
-def linkify(text: str) -> str:
-    """Échappe TOUT le texte distant puis ne crée que des ancres http(s) : aucun HTML distant n'est interprété."""
+def _styled(piece: str, mentions: tuple[str, ...], highlight: str) -> str:
+    """Échappe un morceau de texte puis met en forme @mentions et mot recherché (par découpage : jamais de HTML distant)."""
+    alts = [re.escape("@" + m) for m in sorted(mentions, key=len, reverse=True)]
+    if highlight:
+        alts.append(re.escape(highlight))
+    if not alts:
+        return html.escape(piece)
+    out = []
+    names = {m.casefold() for m in mentions}
+    for i, part in enumerate(re.split("(" + "|".join(alts) + ")", piece, flags=re.IGNORECASE)):
+        if i % 2 == 0:
+            out.append(html.escape(part))
+        elif part.startswith("@") and part[1:].casefold() in names:
+            out.append(f'<span style="color:#FCD34D;font-weight:600">{html.escape(part)}</span>')
+        else:
+            out.append(f'<span style="background-color:rgba(251,191,36,0.45);color:#fff">{html.escape(part)}</span>')
+    return "".join(out)
+
+
+def linkify(text: str, mentions: tuple[str, ...] = (), highlight: str = "") -> str:
+    """Seules des ancres http(s) sont créées ; tout le reste est échappé."""
     out, last = [], 0
     for m in _URL.finditer(text):
-        out.append(html.escape(text[last:m.start()]))
+        out.append(_styled(text[last:m.start()], mentions, highlight))
         url = m.group(1).rstrip(".,;:!?)")
         tail = m.group(1)[len(url):]
         out.append(f'<a href="{html.escape(url, quote=True)}">{html.escape(url)}</a>{html.escape(tail)}')
         last = m.end()
-    out.append(html.escape(text[last:]))
+    out.append(_styled(text[last:], mentions, highlight))
     return "".join(out).replace("\n", "<br/>")
 
 
@@ -48,8 +71,9 @@ def day_label(d: date) -> str:
 
 
 def build_items(messages: list[dict], name_of, group: bool, transfers: dict[str, dict] | None = None,
-                prev_ts: int | None = None, quote_of=None, prev_sender: str | None = None) -> list[dict]:
-    """Transforme des messages en éléments d'affichage (séparateurs de date, messages système)."""
+                prev_ts: int | None = None, quote_of=None, prev_sender: str | None = None,
+                reactions: dict[str, dict] | None = None, me: str = "", new_from: str | None = None) -> list[dict]:
+    """Transforme des messages en éléments d'affichage (séparateurs de date, « nouveaux messages », système)."""
     items: list[dict] = []
     last_day = date.fromtimestamp(prev_ts / 1000) if prev_ts else None
     for m in messages:
@@ -57,13 +81,21 @@ def build_items(messages: list[dict], name_of, group: bool, transfers: dict[str,
         if d != last_day:
             items.append({"type": "date", "text": day_label(d), "mid": f"date-{d.isoformat()}"})
             last_day, prev_sender = d, None
+        if new_from and m["mid"] == new_from:
+            items.append({"type": "new", "text": "Nouveaux messages", "mid": "new-marker"})
+            prev_sender = None
         if m["kind"] == "system":
             items.append({"type": "sys", "text": m["body"] or "", "mid": m["mid"]})
             prev_sender = None
             continue
+        extra = m.get("extra") if isinstance(m.get("extra"), dict) else {}
+        men = extra.get("men") or []
         it = {"type": "msg", "msg": m, "out": m["direction"] == "out", "group": group,
               "name": name_of(m["sender"]) if (group and m["direction"] == "in") else "",
-              "first": m["sender"] != prev_sender, "mid": m["mid"], "sender": m["sender"]}
+              "first": m["sender"] != prev_sender, "mid": m["mid"], "sender": m["sender"],
+              "reactions": (reactions or {}).get(m["mid"], {}), "me": me,
+              "mentions_me": bool(me and me in men),
+              "mention_names": tuple(name_of(i) for i in men) if men else ()}
         if transfers and m["kind"] == "file":
             it["transfer"] = transfers.get(m["mid"])
         if m.get("reply_to") and quote_of:
@@ -145,12 +177,10 @@ def _path(rect: QRectF, tl: float, tr: float, br: float, bl: float) -> QPainterP
 
 
 class ChatDelegate(QStyledItemDelegate):
-    action = Signal(str, str)   # mid, nom d'action
-    link = Signal(str)
-
     SIDE = 22
     PAD_X, PAD_Y = 13, 9
     RADIUS = 18
+    REACT_H = 26
 
     def __init__(self, view: "ChatView"):
         super().__init__(view)
@@ -161,20 +191,56 @@ class ChatDelegate(QStyledItemDelegate):
         self.bold.setWeight(QFont.DemiBold)
         self._cache: dict[tuple, dict] = {}
         self._hot: dict[int, list[tuple[QRect, str, str]]] = {}
-        self._docs: dict[int, tuple[QTextDocument, QRectF]] = {}
+        self._docs: dict[int, tuple[QTextDocument, QRectF, str]] = {}
+        self._thumbs: dict[str, QPixmap | None] = {}
 
     def clear_cache(self) -> None:
         self._cache.clear()
 
-    # -- mise en page ---------------------------------------------------------------------
+    # -- miniatures d'images (formats courants uniquement, taille bornée) ----------------------------
+    def _thumb(self, path: str | None) -> QPixmap | None:
+        if not path or Path(path).suffix.lower() not in IMG_EXT:
+            return None
+        if path in self._thumbs:
+            return self._thumbs[path]
+        pix = None
+        try:
+            if Path(path).is_file() and Path(path).stat().st_size <= 25 * 1024 * 1024:
+                rd = QImageReader(path)
+                rd.setAutoTransform(True)
+                rd.setAllocationLimit(128)  # Mo : protège contre les images piégées
+                sz = rd.size()
+                if sz.isValid() and sz.width() * sz.height() <= 40_000_000:
+                    dpr = self.view.devicePixelRatioF()
+                    rd.setScaledSize(sz.scaled(int(THUMB_MAX[0] * dpr), int(THUMB_MAX[1] * dpr), Qt.KeepAspectRatio))
+                    img = rd.read()
+                    if not img.isNull():
+                        pix = QPixmap.fromImage(img)
+                        pix.setDevicePixelRatio(dpr)
+        except Exception:
+            pix = None
+        self._thumbs[path] = pix
+        return pix
+
+    # -- mise en page ---------------------------------------------------------------------------------
     def _max_bubble(self, width: int) -> int:
         return int(min(max(width * 0.72, 220), 600))
+
+    def _thumb_for(self, it: dict) -> QPixmap | None:
+        tr = it.get("transfer")
+        if it["msg"]["kind"] != "file" or not tr or not tr.get("path"):
+            return None
+        if tr["direction"] == "in" and tr["state"] != "done":
+            return None
+        return self._thumb(tr["path"])
 
     def _layout(self, it: dict, width: int) -> dict:
         m = it["msg"]
         tr = it.get("transfer")
-        key = (m["mid"], width, m["body"], (m.get("extra") or {}).get("edited") if isinstance(m.get("extra"), dict) else None,
-               bool(it.get("name")), bool(it.get("quote")), it.get("first"), tr["state"] if tr else None, m["kind"])
+        extra = m.get("extra") if isinstance(m.get("extra"), dict) else {}
+        key = (m["mid"], width, m["body"], extra.get("edited"), bool(it.get("name")), bool(it.get("quote")), it.get("first"),
+               tr["state"] if tr else None, m["kind"], tuple(it.get("mention_names", ())), self.view.highlight,
+               tr.get("path") if tr else None, theme.current())
         if key in self._cache:
             return self._cache[key]
         out = it["out"]
@@ -191,18 +257,25 @@ class ChatDelegate(QStyledItemDelegate):
             L["quote_y"] = y
             y += 40
         time_txt = datetime.fromtimestamp(m["ts"] / 1000).strftime("%H:%M")
-        edited = isinstance(m.get("extra"), dict) and m["extra"].get("edited")
-        foot_txt = ("modifié · " if edited else "") + time_txt
+        foot_txt = ("modifié · " if extra.get("edited") else "") + time_txt
         foot_w = sfm.horizontalAdvance(foot_txt) + (24 if out else 0) + (16 if m.get("expires_at") else 0) + 4
         L["foot_txt"], L["foot_w"] = foot_txt, foot_w
         if m["kind"] == "file":
+            thumb = self._thumb_for(it)
+            if thumb is not None:
+                L["thumb"] = thumb
+                tw, th = int(thumb.width() / thumb.devicePixelRatio()), int(thumb.height() / thumb.devicePixelRatio())
+                L["thumb_y"], L["thumb_size"] = y, (tw, th)
+                y += th + 8
             L["card_y"] = y
-            card_h = 74 if (tr and tr["state"] in ("receiving", "sending")) else 62
+            card_h = 74 if (tr and tr["state"] in ("receiving", "sending", "paused")) else 62
             if tr and tr["state"] == "offered" and not out:
                 card_h = 98
+            if thumb is not None and card_h == 62:
+                card_h = 50
             L["card_h"] = card_h
             y += card_h
-            w = min(inner_max, 300)
+            w = max(min(inner_max, 300), (L["thumb_size"][0] if thumb is not None else 0))
             L["text_w"], L["foot_inline"] = w, False
             y += 4
             L["foot_y"] = y
@@ -212,8 +285,8 @@ class ChatDelegate(QStyledItemDelegate):
             doc = QTextDocument()
             doc.setDefaultFont(self.font)
             doc.setDocumentMargin(0)
-            doc.setDefaultStyleSheet("a { color: %s; text-decoration: underline; }" % ("#FFFFFF" if out else "#C4B5FD"))
-            doc.setHtml(f"<div>{linkify(m['body'] or '')}</div>")
+            doc.setDefaultStyleSheet("a { color: %s; text-decoration: underline; }" % ("#FFFFFF" if out else theme.accent_hex(2 if theme.is_light() else 3)))
+            doc.setHtml(f"<div>{linkify(m['body'] or '', tuple(it.get('mention_names', ())), self.view.highlight)}</div>")
             doc.setTextWidth(inner_max)
             ideal = int(doc.idealWidth()) + 1
             doc.setTextWidth(max(ideal, 10))
@@ -248,12 +321,12 @@ class ChatDelegate(QStyledItemDelegate):
         t = it["type"]
         if t == "date":
             return QSize(w, 44)
-        if t == "sys":
+        if t in ("sys", "new"):
             return QSize(w, 40)
         L = self._layout(it, w)
-        return QSize(w, L["h"] + (14 if it.get("first") else 3))
+        return QSize(w, L["h"] + (14 if it.get("first") else 3) + (self.REACT_H if it.get("reactions") else 0))
 
-    # -- dessin -----------------------------------------------------------------------------
+    # -- dessin ----------------------------------------------------------------------------------------
     def paint(self, p: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
         it = index.data(ITEM_ROLE)
         if it is None:
@@ -265,9 +338,26 @@ class ChatDelegate(QStyledItemDelegate):
         t = it["type"]
         if t in ("date", "sys"):
             self._paint_pill(p, r, it)
+        elif t == "new":
+            self._paint_new(p, r, it)
         else:
             self._paint_msg(p, r, it, index.row())
         p.restore()
+
+    def _paint_new(self, p: QPainter, r: QRect, it: dict) -> None:
+        p.setFont(self.small)
+        fm = QFontMetrics(self.small)
+        w = fm.horizontalAdvance(it["text"]) + 28
+        cy = r.center().y()
+        p.setPen(QPen(theme.accent(1, 120), 1))
+        p.drawLine(r.left() + 20, cy, int(r.center().x() - w / 2 - 8), cy)
+        p.drawLine(int(r.center().x() + w / 2 + 8), cy, r.right() - 20, cy)
+        rect = QRectF(r.center().x() - w / 2, cy - 11, w, 22)
+        p.setPen(Qt.NoPen)
+        p.setBrush(theme.accent(0, 230))
+        p.drawRoundedRect(rect, 11, 11)
+        p.setPen(QColor("white"))
+        p.drawText(rect, Qt.AlignCenter, it["text"])
 
     def _paint_pill(self, p: QPainter, r: QRect, it: dict) -> None:
         p.setFont(self.small)
@@ -276,18 +366,19 @@ class ChatDelegate(QStyledItemDelegate):
         is_sys = it["type"] == "sys"
         w = fm.horizontalAdvance(text) + 28 + (18 if is_sys else 0)
         rect = QRectF(r.center().x() - w / 2, r.center().y() - 12, w, 24)
-        p.setPen(QPen(QColor(255, 255, 255, 22), 1))
-        p.setBrush(QColor(255, 255, 255, 12))
+        p.setPen(QPen(theme.ov(22), 1))
+        p.setBrush(theme.ov(12))
         p.drawRoundedRect(rect, 12, 12)
         p.setPen(theme.TEXT_2)
         x = rect.left() + 14
         if is_sys:
-            p.drawPixmap(int(x), int(rect.center().y() - 6), icons.pixmap("lock", "#A78BFA", 12))
+            p.drawPixmap(int(x), int(rect.center().y() - 6), icons.pixmap("lock", theme.accent_hex(1), 12))
             x += 18
         p.drawText(QRectF(x, rect.top(), w, rect.height()), Qt.AlignVCenter | Qt.AlignLeft, text)
 
     def _paint_msg(self, p: QPainter, r: QRect, it: dict, row: int) -> None:
         m, out = it["msg"], it["out"]
+        light = theme.is_light()
         L = self._layout(it, r.width())
         top = r.top() + (11 if it.get("first") else 1)
         w, h = L["w"], L["h"]
@@ -299,21 +390,27 @@ class ChatDelegate(QStyledItemDelegate):
         path = _path(rect, rad, rad, cut if out else rad, rad if out else cut)
         if out:
             g = QLinearGradient(rect.topLeft(), rect.bottomRight())
-            g.setColorAt(0, QColor(147, 100, 250, 245))
-            g.setColorAt(1, QColor(109, 40, 217, 245))
+            g.setColorAt(0, theme.accent(0 if light else 1, 245))
+            g.setColorAt(1, theme.accent(2, 245))
             p.fillPath(path, g)
             hi = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-            hi.setColorAt(0, QColor(255, 255, 255, 46))
-            hi.setColorAt(0.45, QColor(255, 255, 255, 0))
+            hi.setColorAt(0, theme.on_accent(46))
+            hi.setColorAt(0.45, theme.on_accent(0))
             p.fillPath(path, hi)
-            p.setPen(QPen(QColor(248, 113, 113, 230) if failed else QColor(216, 200, 255, 90), 1))
+            p.setPen(QPen(QColor(248, 113, 113, 230) if failed else theme.accent(3, 90), 1))
         else:
-            p.fillPath(path, QColor(255, 255, 255, 22))
-            hi = QLinearGradient(rect.topLeft(), rect.bottomLeft())
-            hi.setColorAt(0, QColor(255, 255, 255, 22))
-            hi.setColorAt(0.5, QColor(255, 255, 255, 0))
-            p.fillPath(path, hi)
-            p.setPen(QPen(QColor(255, 255, 255, 36), 1))
+            if light:
+                p.fillPath(path, QColor(255, 255, 255, 215))
+            else:
+                p.fillPath(path, QColor(255, 255, 255, 22))
+                hi = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+                hi.setColorAt(0, QColor(255, 255, 255, 22))
+                hi.setColorAt(0.5, QColor(255, 255, 255, 0))
+                p.fillPath(path, hi)
+            if it.get("mentions_me"):
+                p.setPen(QPen(QColor(252, 211, 77, 220), 1.6))
+            else:
+                p.setPen(QPen(theme.ov(36), 1))
         p.setBrush(Qt.NoBrush)
         p.drawPath(path)
         hot: list[tuple[QRect, str, str]] = []
@@ -321,8 +418,7 @@ class ChatDelegate(QStyledItemDelegate):
         sfm = QFontMetrics(self.small)
         if "name_y" in L:
             c1, _ = theme.avatar_colors(it["sender"])
-            c1.setHsv(c1.hue(), max(90, c1.saturation() - 60), 255)
-            p.setFont(self.small)
+            c1.setHsv(c1.hue(), max(90, c1.saturation() - 60), 190 if light else 255)
             f = QFont(self.small)
             f.setBold(True)
             p.setFont(f)
@@ -332,17 +428,17 @@ class ChatDelegate(QStyledItemDelegate):
             q = it["quote"]
             qr = QRectF(cx, rect.top() + L["quote_y"], rect.width() - 2 * self.PAD_X, 36)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(0, 0, 0, 55) if out else QColor(255, 255, 255, 20))
+            p.setBrush(QColor(0, 0, 0, 55) if out else theme.ov(20))
             p.drawRoundedRect(qr, 9, 9)
-            p.setBrush(QColor("#C4B5FD"))
+            p.setBrush(theme.accent(0 if (light and not out) else 3))
             p.drawRoundedRect(QRectF(qr.left(), qr.top() + 5, 3, qr.height() - 10), 1.5, 1.5)
             f = QFont(self.small)
             f.setBold(True)
             p.setFont(f)
-            p.setPen(QColor("#E9E3FF") if out else QColor("#C4B5FD"))
+            p.setPen(theme.on_accent(235) if out else theme.accent(0 if light else 3))
             p.drawText(QPointF(qr.left() + 10, qr.top() + 15), q["name"])
             p.setFont(self.small)
-            p.setPen(QColor(255, 255, 255, 190))
+            p.setPen(theme.on_accent(200) if out else theme.ink(190))
             txt = sfm.elidedText(q["text"].replace("\n", " "), Qt.ElideRight, int(qr.width() - 18))
             p.drawText(QPointF(qr.left() + 10, qr.top() + 29), txt)
         if m["kind"] == "file":
@@ -352,14 +448,23 @@ class ChatDelegate(QStyledItemDelegate):
             p.save()
             p.translate(cx, rect.top() + L["text_y"])
             pc = QAbstractTextDocumentLayout.PaintContext()
-            pc.palette.setColor(pc.palette.ColorRole.Text, QColor("#FFFFFF") if out else QColor("#F3F3F8"))
+            pc.palette.setColor(pc.palette.ColorRole.Text, QColor("#FFFFFF") if out else theme.ink())
+            if self.view.sel_mid == it["mid"] and self.view.sel_a != self.view.sel_b:
+                cur = QTextCursor(doc)
+                cur.setPosition(min(self.view.sel_a, self.view.sel_b))
+                cur.setPosition(max(self.view.sel_a, self.view.sel_b), QTextCursor.KeepAnchor)
+                sel = QAbstractTextDocumentLayout.Selection()
+                sel.cursor = cur
+                sel.format.setBackground(QColor(255, 255, 255, 90) if out else theme.accent(0, 120))
+                sel.format.setForeground(QColor("#FFFFFF"))
+                pc.selections = [sel]
             doc.documentLayout().draw(p, pc)
             p.restore()
-            self._docs[row] = (doc, QRectF(cx, rect.top() + L["text_y"], doc.textWidth(), doc.size().height()))
+            self._docs[row] = (doc, QRectF(cx, rect.top() + L["text_y"], doc.textWidth(), doc.size().height()), it["mid"])
         # pied : heure, état
         fy = rect.top() + L["foot_y"]
         p.setFont(self.small)
-        p.setPen(QColor(255, 255, 255, 170) if out else theme.TEXT_3)
+        p.setPen(theme.on_accent(175) if out else theme.TEXT_3)
         fx = rect.right() - self.PAD_X
         if out:
             self._paint_status(p, m["status"], fx - 16, fy + sfm.height() / 2)
@@ -368,19 +473,42 @@ class ChatDelegate(QStyledItemDelegate):
                    Qt.AlignRight | Qt.AlignVCenter, L["foot_txt"])
         if m.get("expires_at"):
             tx = fx - sfm.horizontalAdvance(L["foot_txt"]) - 16
-            p.drawPixmap(int(tx), int(fy + 1), icons.pixmap("timer", "#E9E3FF" if out else "#A78BFA", 12))
+            p.drawPixmap(int(tx), int(fy + 1), icons.pixmap("timer", "#E9E3FF" if out else theme.accent_hex(1), 12))
         if failed:
             rr = QRect(int(rect.left() - 84) if out else int(rect.right() + 8), int(rect.center().y() - 12), 76, 24)
             p.setPen(QPen(QColor(248, 113, 113, 180), 1))
             p.setBrush(QColor(248, 113, 113, 36))
             p.drawRoundedRect(rr, 12, 12)
-            p.setPen(QColor("#FCA5A5"))
+            p.setPen(QColor("#B91C1C") if light else QColor("#FCA5A5"))
             p.drawText(rr, Qt.AlignCenter, "Réessayer")
             hot.append((rr, "retry", m["mid"]))
+        # réactions : pastilles sous la bulle
+        if it.get("reactions"):
+            rx = rect.right() - 4 if out else rect.left() + 4
+            ry = rect.bottom() + 3
+            chips = []
+            ef = QFont(self.small)
+            ef.setPointSizeF(9.5)
+            efm = QFontMetrics(ef)
+            for emoji, who in it["reactions"].items():
+                lab = emoji + (f" {len(who)}" if len(who) > 1 else "")
+                chips.append((emoji, lab, efm.horizontalAdvance(lab) + 18, it["me"] in who))
+            total = sum(c[2] + 5 for c in chips) - 5
+            cxr = rx - total if out else rx
+            p.setFont(ef)
+            for emoji, lab, cw, mine in chips:
+                cr = QRectF(cxr, ry, cw, 22)
+                p.setPen(QPen(theme.accent(1, 200) if mine else theme.ov(40), 1))
+                p.setBrush(theme.accent(0, 70) if mine else (QColor(255, 255, 255, 200) if light else theme.ov(22)))
+                p.drawRoundedRect(cr, 11, 11)
+                p.setPen(theme.ink())
+                p.drawText(cr, Qt.AlignCenter, lab)
+                hot.append((cr.toRect(), "react:" + emoji, m["mid"]))
+                cxr += cw + 5
         self._hot[row] = hot
 
     def _paint_status(self, p: QPainter, status: str, x: float, cy: float) -> None:
-        col = {"read": QColor("#67E8F9"), "failed": QColor("#FCA5A5")}.get(status, QColor(255, 255, 255, 175))
+        col = {"read": QColor("#67E8F9"), "failed": QColor("#FCA5A5")}.get(status, theme.on_accent(175))
         pen = QPen(col, 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
@@ -399,7 +527,7 @@ class ChatDelegate(QStyledItemDelegate):
                 p.drawPath(path)
             if status == "sent":
                 tick(2)
-            else:  # delivered, read
+            else:
                 tick(-1)
                 tick(4)
 
@@ -407,68 +535,115 @@ class ChatDelegate(QStyledItemDelegate):
         m, out, tr = it["msg"], it["out"], it.get("transfer")
         extra = m.get("extra") if isinstance(m.get("extra"), dict) else {}
         cx = rect.left() + self.PAD_X
+        if "thumb" in L:
+            tw, th = L["thumb_size"]
+            tr_ = QRectF(cx, rect.top() + L["thumb_y"], tw, th)
+            clip = QPainterPath()
+            clip.addRoundedRect(tr_, 12, 12)
+            p.save()
+            p.setClipPath(clip)
+            p.drawPixmap(tr_.toRect().topLeft(), L["thumb"])
+            p.restore()
+            hot.append((tr_.toRect(), "open", m["mid"]))
         cy = rect.top() + L["card_y"]
         card = QRectF(cx, cy, rect.width() - 2 * self.PAD_X, L["card_h"])
+        compact = "thumb" in L
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(0, 0, 0, 55) if out else QColor(255, 255, 255, 18))
+        p.setBrush(QColor(0, 0, 0, 55) if out else theme.ov(18))
         p.drawRoundedRect(card, 12, 12)
-        ic = QRectF(card.left() + 10, card.top() + 10, 40, 40)
-        p.setBrush(QColor(255, 255, 255, 30))
-        p.drawRoundedRect(ic, 10, 10)
-        p.drawPixmap(int(ic.left() + 10), int(ic.top() + 10), icons.pixmap("file", "#FFFFFF", 20))
+        ink_main = QColor("#FFFFFF") if out else theme.ink()
+        ink_sub = theme.on_accent(175) if out else theme.TEXT_2
+        if not compact:
+            ic = QRectF(card.left() + 10, card.top() + 10, 40, 40)
+            p.setBrush(theme.on_accent(30) if out else theme.ov(26))
+            p.drawRoundedRect(ic, 10, 10)
+            p.drawPixmap(int(ic.left() + 10), int(ic.top() + 10), icons.pixmap("file", "#FFFFFF" if out else theme.icon_hex(1), 20))
+            tx = ic.right() + 10
+        else:
+            tx = card.left() + 12
         sfm = QFontMetrics(self.small)
         fm = QFontMetrics(self.font)
-        tx = ic.right() + 10
         tw = int(card.right() - tx - 10)
         p.setFont(self.bold)
-        p.setPen(QColor("#FFFFFF"))
-        p.drawText(QPointF(tx, card.top() + 25), fm.elidedText(extra.get("name", m["body"] or "fichier"), Qt.ElideMiddle, tw))
+        p.setPen(ink_main)
+        top_off = 20 if compact else 25
+        p.drawText(QPointF(tx, card.top() + top_off), fm.elidedText(extra.get("name", m["body"] or "fichier"), Qt.ElideMiddle, tw))
         state = tr["state"] if tr else ("done" if out else "failed")
         size = human_size(int(extra.get("size", 0)))
         label = {"offered": "Proposé" if not out else "En attente d'acceptation", "receiving": "Réception…", "sending": "Envoi…",
-                 "paused": "En pause", "done": "Terminé" if not out else "Envoyé", "declined": "Refusé", "failed": "Échec"}.get(state, "")
+                 "paused": "En pause", "done": "Terminé" if not out else "Envoyé", "declined": "Refusé", "failed": "Échec",
+                 "cancelled": "Annulé"}.get(state, "")
         p.setFont(self.small)
-        p.setPen(QColor(255, 255, 255, 175))
-        p.drawText(QPointF(tx, card.top() + 43), f"{size} · {label}")
-        if tr and state in ("receiving", "sending"):
-            pb = QRectF(card.left() + 10, card.bottom() - 14, card.width() - 20, 5)
+        p.setPen(ink_sub)
+        p.drawText(QPointF(tx, card.top() + top_off + 18), f"{size} · {label}")
+        if tr and state in ("receiving", "sending", "paused"):
+            pb = QRectF(card.left() + 10, card.bottom() - 14, card.width() - 96, 5)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(255, 255, 255, 35))
+            p.setBrush(theme.on_accent(40) if out else theme.ov(35))
             p.drawRoundedRect(pb, 2.5, 2.5)
-            frac = min(1.0, tr["next_idx"] / max(1, tr["nchunks"])) if state == "receiving" else it.get("progress", 0.0)
-            p.setBrush(QColor("#FFFFFF") if out else QColor("#A78BFA"))
+            frac = it.get("progress", 0.0) if tr["direction"] == "out" else min(1.0, tr["next_idx"] / max(1, tr["nchunks"]))
+            p.setBrush(QColor("#FFFFFF") if out else theme.accent(1))
             p.drawRoundedRect(QRectF(pb.left(), pb.top(), pb.width() * frac, pb.height()), 2.5, 2.5)
+            p.setPen(ink_sub)
+            p.drawText(QRectF(pb.right() + 6, pb.top() - 7, 40, 18), Qt.AlignLeft | Qt.AlignVCenter, f"{int(frac * 100)} %")
+            cr = QRect(int(card.right() - 54), int(card.bottom() - 21), 46, 18)
+            p.setPen(QPen(theme.on_accent(150) if out else theme.ov(60), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(cr, 9, 9)
+            p.setPen(ink_main)
+            p.drawText(cr, Qt.AlignCenter, "Annuler")
+            hot.append((cr, "cancel", m["mid"]))
         if tr and not out and state == "offered":
             for i, (txt, name, primary) in enumerate((("Accepter", "accept", True), ("Refuser", "decline", False))):
                 br = QRect(int(card.left() + 10 + i * 96), int(card.bottom() - 36), 88, 28)
-                p.setPen(QPen(QColor(196, 181, 253, 120), 1))
-                p.setBrush(QColor(139, 92, 246, 190) if primary else QColor(255, 255, 255, 18))
+                p.setPen(QPen(theme.accent(3, 120), 1))
+                p.setBrush(theme.accent(0, 200) if primary else theme.ov(18))
                 p.drawRoundedRect(br, 10, 10)
-                p.setPen(QColor("white"))
+                p.setPen(QColor("white") if primary else theme.ink())
                 p.setFont(self.bold)
                 p.drawText(br, Qt.AlignCenter, txt)
                 hot.append((br, name, m["mid"]))
-        if tr and not out and state == "done":
+        if tr and out and state == "offered":
+            cr = QRect(int(card.right() - 78), int(card.bottom() - 30), 68, 22)
+            p.setPen(QPen(theme.on_accent(150), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawRoundedRect(cr, 11, 11)
+            p.setPen(ink_main)
+            p.setFont(self.small)
+            p.drawText(cr, Qt.AlignCenter, "Annuler")
+            hot.append((cr, "cancel", m["mid"]))
+        if tr and state == "done" and "thumb" not in L:
             hot.append((card.toRect(), "open", m["mid"]))
         if tr and not out and state in ("failed", "paused"):
             hot.append((card.toRect(), "accept", m["mid"]))
 
-    # -- interaction -------------------------------------------------------------------------
+    # -- interaction ---------------------------------------------------------------------------------------
     def hotspot_at(self, row: int, pos) -> tuple[str, str] | None:
         for rect, name, mid in self._hot.get(row, ()):
             if rect.contains(pos):
                 return name, mid
         return None
 
-    def anchor_at(self, row: int, pos, item_rect: QRect) -> str | None:
+    def doc_at(self, row: int, pos):
         entry = self._docs.get(row)
+        if entry and entry[1].adjusted(-2, -2, 2, 2).contains(QPointF(pos)):
+            return entry
+        return None
+
+    def anchor_at(self, row: int, pos, item_rect: QRect) -> str | None:
+        entry = self.doc_at(row, pos)
         if not entry:
             return None
-        doc, r = entry
-        if r.contains(QPointF(pos)):
-            a = doc.documentLayout().anchorAt(QPointF(pos) - r.topLeft())
-            return a or None
-        return None
+        doc, r, _ = entry
+        a = doc.documentLayout().anchorAt(QPointF(pos) - r.topLeft())
+        return a or None
+
+    def text_pos(self, row: int, pos) -> tuple[str, int] | None:
+        entry = self.doc_at(row, pos)
+        if not entry:
+            return None
+        doc, r, mid = entry
+        return mid, doc.documentLayout().hitTest(QPointF(pos) - r.topLeft(), Qt.FuzzyHit)
 
 
 class ChatView(QListView):
@@ -476,11 +651,16 @@ class ChatView(QListView):
     link = Signal(str)
     context = Signal(str, object)
     load_more = Signal()
+    scrolled = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.model_ = ChatModel(self)
         self.setModel(self.model_)
+        self.highlight = ""
+        self.sel_mid: str | None = None
+        self.sel_a = self.sel_b = 0
+        self._dragging = False
         self.delegate = ChatDelegate(self)
         self.setItemDelegate(self.delegate)
         self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
@@ -499,6 +679,7 @@ class ChatView(QListView):
         self._loading = False
 
     def _on_scroll(self, v: int) -> None:
+        self.scrolled.emit()
         if v <= 40 and self.model_.rowCount() and not self._loading:
             self.load_more.emit()
 
@@ -509,32 +690,94 @@ class ChatView(QListView):
     def scroll_bottom(self) -> None:
         QTimer.singleShot(0, lambda: self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
 
+    def scroll_to_mid(self, mid: str, center: bool = True) -> None:
+        row = self.model_.row_of(mid)
+        if row >= 0:
+            hint = QAbstractItemView.ScrollHint.PositionAtCenter if center else QAbstractItemView.ScrollHint.PositionAtTop
+            QTimer.singleShot(60, lambda: self.scrollTo(self.model_.index(row), hint))
+
     def resizeEvent(self, e) -> None:
         self.delegate.clear_cache()
         super().resizeEvent(e)
         self.scheduleDelayedItemsLayout()
+
+    # -- sélection de texte -----------------------------------------------------------------------
+    def clear_selection(self) -> None:
+        if self.sel_mid:
+            self.sel_mid, self.sel_a, self.sel_b = None, 0, 0
+            self.viewport().update()
+
+    def selected_text(self) -> str:
+        if not self.sel_mid or self.sel_a == self.sel_b:
+            return ""
+        row = self.model_.row_of(self.sel_mid)
+        entry = self.delegate._docs.get(row)
+        if not entry:
+            return ""
+        a, b = sorted((self.sel_a, self.sel_b))
+        return entry[0].toPlainText()[a:b]
+
+    def keyPressEvent(self, e) -> None:
+        if e.matches(QKeySequence.Copy) and self.selected_text():
+            QGuiApplication.clipboard().setText(self.selected_text())
+            return
+        super().keyPressEvent(e)
 
     def _index_item(self, pos):
         idx = self.indexAt(pos)
         return idx, (idx.data(ITEM_ROLE) if idx.isValid() else None)
 
     def mouseMoveEvent(self, e) -> None:
-        idx, it = self._index_item(e.position().toPoint())
+        pt = e.position().toPoint()
+        idx, it = self._index_item(pt)
         cursor = Qt.ArrowCursor
         if it and it["type"] == "msg":
-            pt = e.position().toPoint()
             if self.delegate.hotspot_at(idx.row(), pt) or self.delegate.anchor_at(idx.row(), pt, self.visualRect(idx)):
                 cursor = Qt.PointingHandCursor
+            elif self.delegate.doc_at(idx.row(), pt):
+                cursor = Qt.IBeamCursor
         self.viewport().setCursor(cursor)
+        if self._dragging and self.sel_mid and it and it.get("mid") == self.sel_mid:
+            tp = self.delegate.text_pos(idx.row(), pt)
+            if tp and tp[0] == self.sel_mid:
+                self.sel_b = tp[1]
+                self.viewport().update()
         super().mouseMoveEvent(e)
 
     def mousePressEvent(self, e) -> None:
-        self._press = e.position().toPoint()
+        pt = e.position().toPoint()
+        self._press = pt
+        if e.button() == Qt.LeftButton:
+            idx, it = self._index_item(pt)
+            tp = self.delegate.text_pos(idx.row(), pt) if it and it["type"] == "msg" else None
+            if tp:
+                self.sel_mid, self.sel_a, self.sel_b = tp[0], tp[1], tp[1]
+                self._dragging = True
+            else:
+                self.clear_selection()
         super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e) -> None:
+        pt = e.position().toPoint()
+        idx, it = self._index_item(pt)
+        entry = self.delegate.doc_at(idx.row(), pt) if it and it["type"] == "msg" else None
+        if entry:
+            doc, r, mid = entry
+            pos = doc.documentLayout().hitTest(QPointF(pt) - r.topLeft(), Qt.FuzzyHit)
+            cur = QTextCursor(doc)
+            cur.setPosition(pos)
+            cur.select(QTextCursor.WordUnderCursor)
+            self.sel_mid, self.sel_a, self.sel_b = mid, cur.selectionStart(), cur.selectionEnd()
+            self._dragging = False
+            self.viewport().update()
+            return
+        super().mouseDoubleClickEvent(e)
 
     def mouseReleaseEvent(self, e) -> None:
         pt = e.position().toPoint()
+        self._dragging = False
         if e.button() == Qt.LeftButton and self._press and (pt - self._press).manhattanLength() < 6:
+            self.clear_selection()
             idx, it = self._index_item(pt)
             if it and it["type"] == "msg":
                 hs = self.delegate.hotspot_at(idx.row(), pt)
@@ -553,7 +796,7 @@ class ChatView(QListView):
 
     def set_items(self, items: list[dict]) -> None:
         self._loading = True
+        self.clear_selection()
         self.delegate.clear_cache()
         self.model_.reset(items)
-        self.scroll_bottom()
         QTimer.singleShot(150, lambda: setattr(self, "_loading", False))

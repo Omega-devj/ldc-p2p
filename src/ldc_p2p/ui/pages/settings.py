@@ -1,6 +1,8 @@
 """Page « Paramètres » organisée par catégories."""
 from __future__ import annotations
 
+import asyncio
+import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -11,17 +13,21 @@ from ...crypto.identity import InvalidPassword, Keystore
 from ...profile import Profile, export_backup, import_backup
 from ..controller import UiController
 from ..dialogs import (ConfirmDialog, DiagnosticsDialog, PasswordPrompt, RecoveryDialog, TextPrompt, button, copy_text)
+from .. import theme
 from ..widgets.glass import GlassPanel, Switch, label
 
 
 class SettingsPage(QWidget):
     logout_requested = Signal(bool)   # True = supprimer le profil
+    theme_changed = Signal(str, str)
+    security_changed = Signal()
     status_message = Signal(str, str)
 
     def __init__(self, ctrl: UiController, profile: Profile, parent=None):
         super().__init__(parent)
         self.ctrl, self.engine, self.profile = ctrl, ctrl.engine, profile
         self.ks_path = profile.directory / "keystore.json"
+        self.updates = None
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         panel = GlassPanel(radius=24)
@@ -39,10 +45,13 @@ class SettingsPage(QWidget):
         sa.setWidget(holder)
         pl.addWidget(sa, 1)
         self._account()
+        self._appearance()
         self._network()
+        self._security()
         self._privacy()
         self._notifications()
         self._files()
+        self._windows()
         self._updates()
         self._about()
         self.col.addStretch(1)
@@ -114,8 +123,11 @@ class SettingsPage(QWidget):
         ex, im = button("Exporter", "", "download"), button("Importer", "")
         ex.clicked.connect(self._export)
         im.clicked.connect(self._import)
-        r = self._row(L, "Sauvegarde chiffrée", "Contacts, groupes et réglages (pas l'historique des messages).", ex)
+        r = self._row(L, "Sauvegarde chiffrée", "Contacts, groupes et réglages.", ex)
         r.addWidget(im)
+        hx = button("Exporter l'historique", "", "download")
+        hx.clicked.connect(self._export_history)
+        self._row(L, "Historique des messages", "Fichier chiffré par une phrase secrète (texte et noms de fichiers).", hx)
         out = button("Verrouiller / changer de profil", "", "lock")
         out.clicked.connect(lambda: self.logout_requested.emit(False))
         dl = button("Supprimer ce profil", "danger", "trash", "#FCA5A5")
@@ -133,21 +145,150 @@ class SettingsPage(QWidget):
         port.setRange(1, 65535)
         port.setValue(s.server_port)
         tls = Switch(s.server_tls)
+        token = QLineEdit(s.server_token)
+        token.setEchoMode(QLineEdit.Password)
+        token.setPlaceholderText("seulement si le serveur est privé")
+        token.setMinimumWidth(240)
         apply = button("Appliquer", "primary")
+        test = button("Tester la connexion", "", "wifi")
+        dirty = label("", "faint")
+        result = label("", "muted", wrap=True)
+
+        def current() -> tuple:
+            return host.text().strip(), port.value(), tls.isChecked(), token.text()
+
+        def saved() -> tuple:
+            return s.server_host, s.server_port, s.server_tls, s.server_token
+
+        def refresh_dirty(*_) -> None:
+            d = current() != saved()
+            dirty.setText("● Modifications non enregistrées — cliquez sur Appliquer" if d else "")
+            dirty.setStyleSheet("color: #FBBF24; font-weight: 600;")
+            apply.setEnabled(d)
+
+        def show(ok: bool | None, text: str) -> None:
+            result.setText(text)
+            result.setProperty("role", "muted" if ok is None else ("ok" if ok else "error"))
+            result.style().unpolish(result)
+            result.style().polish(result)
 
         def do_apply() -> None:
-            s.server_host, s.server_port, s.server_tls = host.text().strip(), port.value(), tls.isChecked()
+            s.server_host, s.server_port, s.server_tls, s.server_token = current()
             self.engine.apply_server_settings()
-            self.status_message.emit("Serveur mis à jour — reconnexion…", "ok")
+            refresh_dirty()
+            show(None, "Reconnexion en cours…")
+            self.status_message.emit("Réglages du serveur enregistrés — reconnexion…", "ok")
+
+        def do_test() -> None:
+            from ...network.errors import probe_server
+            show(None, "Test en cours…")
+            h, p_, t, tok = current()
+
+            async def run() -> None:
+                r = await probe_server(h, p_, t, tok)
+                show(r.ok, ("✓ " if r.ok else "✗ ") + r.message)
+            asyncio.ensure_future(run())
+
+        for w in (host, token):
+            w.textChanged.connect(refresh_dirty)
+        port.valueChanged.connect(refresh_dirty)
+        tls.toggled.connect(refresh_dirty)
         apply.clicked.connect(do_apply)
+        test.clicked.connect(do_test)
         self._row(L, "Serveur de rendez-vous", "Sert à retrouver vos contacts et de relais chiffré si la connexion directe échoue. Il ne peut pas lire vos messages.", host)
-        r = self._row(L, "Port", "", port)
-        self._row(L, "Chiffrer la connexion au serveur (TLS)", "Recommandé : masque vos métadonnées aux observateurs du réseau.", tls)
-        L.addWidget(apply, 0, Qt.AlignRight)
-        self._switch(L, "Connexions directes", "Pair à pair sur réseau local, IPv6 ou port redirigé. Appliqué au prochain démarrage.", "direct_enabled")
+        self._row(L, "Port", "", port)
+        self._row(L, "Chiffrer la connexion au serveur (TLS)", "Recommandé sur Internet. Désactivez-le pour un serveur local lancé sans certificat.", tls)
+        self._row(L, "Jeton d'accès", "Demandé par les serveurs privés.", token)
+        r = QHBoxLayout()
+        r.addWidget(dirty, 1)
+        r.addWidget(test)
+        r.addWidget(apply)
+        L.addLayout(r)
+        L.addWidget(result)
+        refresh_dirty()
+        sw = Switch(bool(s.direct_enabled))
+        sw.toggled.connect(lambda v: self.ctrl.run(self.engine.set_direct_enabled(v)))
+        self._row(L, "Connexions directes", "Pair à pair sur réseau local, IPv6 ou port redirigé. Appliqué immédiatement.", sw)
         diag = button("Ouvrir le diagnostic", "", "wifi")
         diag.clicked.connect(lambda: DiagnosticsDialog(self, self.engine).exec())
         self._row(L, "Diagnostic réseau", "Voir pourquoi un contact est ou n'est pas joignable.", diag)
+
+    def _appearance(self) -> None:
+        from PySide6.QtWidgets import QComboBox
+        from .. import prefs, sounds
+        L = self._card("Apparence et sons")
+        mode = QComboBox()
+        for txt, val in (("Sombre (Liquid Glass)", "sombre"), ("Clair", "clair")):
+            mode.addItem(txt, val)
+        cur_mode, cur_acc = theme.current()
+        mode.setCurrentIndex(max(0, mode.findData(cur_mode)))
+        acc = QComboBox()
+        for name in theme.ACCENTS:
+            acc.addItem(name.capitalize(), name)
+        acc.setCurrentIndex(max(0, acc.findData(cur_acc)))
+
+        def changed(*_) -> None:
+            prefs.save(mode.currentData(), acc.currentData())
+            self.theme_changed.emit(mode.currentData(), acc.currentData())
+        mode.activated.connect(changed)
+        acc.activated.connect(changed)
+        self._row(L, "Thème", "S'applique immédiatement.", mode)
+        self._row(L, "Couleur d'accent", "", acc)
+        if sys.platform == "win32":
+            self._switch(L, "Flou Windows 11 (expérimental)", "Effet verre réel derrière la fenêtre. Redémarrage conseillé.", "backdrop")
+        snd = QComboBox()
+        for k, v in sounds.LABELS.items():
+            snd.addItem(v, k)
+        snd.setCurrentIndex(max(0, snd.findData(self.engine.settings.sound_name)))
+
+        def pick(i: int) -> None:
+            self.engine.settings.sound_name = snd.itemData(i)
+            self.engine.settings.save(self.engine.db)
+            sounds.play(snd.itemData(i))
+        snd.activated.connect(pick)
+        self._switch(L, "Son de notification", "Joué à la réception d'un message (sauf « Ne pas déranger » et conversations muettes).", "sound")
+        self._row(L, "Sonnerie", "", snd)
+
+    def _security(self) -> None:
+        from PySide6.QtWidgets import QComboBox
+        L = self._card("Sécurité de l'application")
+        lock = QComboBox()
+        for txt, v in (("Jamais", 0), ("1 minute", 1), ("5 minutes", 5), ("15 minutes", 15), ("30 minutes", 30), ("1 heure", 60)):
+            lock.addItem(txt, v)
+        lock.setCurrentIndex(max(0, lock.findData(self.engine.settings.lock_minutes)))
+
+        def chg(i: int) -> None:
+            self.engine.settings.lock_minutes = lock.itemData(i)
+            self.engine.settings.save(self.engine.db)
+            self.security_changed.emit()
+        lock.currentIndexChanged.connect(chg)
+        self._row(L, "Verrouillage automatique", "Après inactivité, l'écran est masqué jusqu'à la saisie du mot de passe (Ctrl+L pour verrouiller tout de suite). Les messages continuent d'arriver.", lock)
+        away = QComboBox()
+        for txt, v in (("Jamais", 0), ("5 minutes", 5), ("10 minutes", 10), ("30 minutes", 30)):
+            away.addItem(txt, v)
+        away.setCurrentIndex(max(0, away.findData(self.engine.settings.auto_away_minutes)))
+
+        def chg2(i: int) -> None:
+            self.engine.settings.auto_away_minutes = away.itemData(i)
+            self.engine.settings.save(self.engine.db)
+            self.security_changed.emit()
+        away.currentIndexChanged.connect(chg2)
+        self._row(L, "Passer en « Absent » après", "Revient en « En ligne » dès que vous reprenez la main.", away)
+        if sys.platform == "win32":
+            self._switch(L, "Protéger contre les captures d'écran", "La fenêtre apparaît noire dans les captures et partages d'écran (Windows 10 2004+).", "capture_protection",
+                         after=lambda v: self.security_changed.emit())
+
+    def _windows(self) -> None:
+        from .. import winint
+        if not winint.IS_WIN:
+            return
+        L = self._card("Windows")
+        sw = Switch(winint.autostart_enabled())
+        sw.toggled.connect(lambda v: self.status_message.emit("Démarrage automatique " + ("activé" if v else "désactivé"), "ok") if winint.set_autostart(v) else self.status_message.emit("Impossible de modifier le démarrage automatique", "error"))
+        self._row(L, "Lancer LDC P2P au démarrage de Windows", "", sw)
+        reg = button("Associer les liens ldc://" if not winint.protocol_registered() else "Liens ldc:// associés ✓", "")
+        reg.clicked.connect(lambda: self.status_message.emit("Liens ldc:// associés", "ok") if winint.register_protocol() else self.status_message.emit("Association impossible", "error"))
+        self._row(L, "Liens d'invitation", "Un lien ldc://add/… ouvre directement l'ajout de contact.", reg)
 
     def _privacy(self) -> None:
         L = self._card("Confidentialité")
@@ -191,54 +332,24 @@ class SettingsPage(QWidget):
         self._row(L, "Accepter automatiquement jusqu'à", "Les fichiers exécutables demandent toujours une confirmation.", spin)
 
     def _updates(self) -> None:
-        from ... import release_key
+        from PySide6.QtWidgets import QComboBox
+        from ... import updater
         L = self._card("Mises à jour")
-        url = QLineEdit(self.engine.settings.update_url)
-        url.setPlaceholderText("https://… (adresse des mises à jour, fournie par l'éditeur)")
-        url.setMinimumWidth(300)
+        e = self.engine
+        combo = QComboBox()
+        for txt, val in (("Me prévenir", 1), ("Installer automatiquement", 2), ("Jamais", 0)):
+            combo.addItem(txt, val)
+        combo.setCurrentIndex(max(0, combo.findData(e.settings.auto_update)))
 
-        def save() -> None:
-            self.engine.settings.update_url = url.text().strip()
-            self.engine.settings.save(self.engine.db)
-        url.editingFinished.connect(save)
-        btn = button("Rechercher", "", "refresh")
-        configured = bool(release_key.RELEASE_PUBLIC_KEY_HEX)
-        btn.setEnabled(configured)
-        btn.clicked.connect(lambda: (save(), self._check_update()))
-        self._row(L, "Source des mises à jour", "Les mises à jour sont signées : l'application refuse tout fichier dont la signature ou l'empreinte ne correspond pas." if configured
-                  else "Désactivé dans cette version : aucune clé de publication n'est intégrée (voir docs/DISTRIBUTION.md).", url)
-        self._row(L, "Version installée", __version__, btn)
-
-    def _check_update(self) -> None:
-        import asyncio
-        from ... import release_key, updater
-        s = self.engine.settings
-        if not s.update_url:
-            self.status_message.emit("Renseignez d'abord l'adresse des mises à jour.", "error")
-            return
-
-        async def run() -> None:
-            loop = asyncio.get_running_loop()
-            try:
-                up = await loop.run_in_executor(None, updater.check_for_update, s.update_url, __version__, bytes.fromhex(release_key.RELEASE_PUBLIC_KEY_HEX))
-            except Exception as e:
-                self.status_message.emit(f"Vérification impossible : {e}", "error")
-                return
-            if up is None:
-                self.status_message.emit("Vous utilisez la dernière version.", "ok")
-                return
-            if not ConfirmDialog(self, f"Version {up.version} disponible", (up.notes or "Une nouvelle version est disponible.") + "\n\nLe fichier sera vérifié (signature et empreinte) avant toute installation.", "Télécharger").exec():
-                return
-            try:
-                out = await loop.run_in_executor(None, updater.download_update, up, self.profile.directory.parent.parent / "updates")
-            except Exception as e:
-                self.status_message.emit(f"Téléchargement refusé : {e}", "error")
-                return
-            self.status_message.emit(f"Téléchargé et vérifié : {out.name}", "ok")
-            from PySide6.QtCore import QUrl
-            from PySide6.QtGui import QDesktopServices
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out.parent)))
-        asyncio.ensure_future(run())
+        def chg(i: int) -> None:
+            e.settings.auto_update = combo.itemData(i)
+            e.settings.save(e.db)
+        combo.currentIndexChanged.connect(chg)
+        self._row(L, "Quand une nouvelle version est publiée", "Vérifié au démarrage puis toutes les 6 heures. Les mises à jour sont signées : "
+                  "tout fichier dont la signature ou l'empreinte ne correspond pas est refusé.", combo)
+        btn = button("Rechercher maintenant", "primary", "refresh", "#FFFFFF")
+        btn.clicked.connect(lambda: self.updates and asyncio.ensure_future(self.updates.check(manual=True)))
+        self._row(L, f"Version installée : {updater.current_version()}", f"Source : {e.settings.update_url}", btn)
 
     def _about(self) -> None:
         L = self._card("À propos")
@@ -284,6 +395,18 @@ class SettingsPage(QWidget):
         if path:
             export_backup(self.engine.db, self.engine.identity, Path(path), p.new_value)
             self.status_message.emit("Sauvegarde enregistrée", "ok")
+
+    def _export_history(self) -> None:
+        from ...profile import export_history
+        p = PasswordPrompt(self, "Exporter l'historique", "Confirmez votre mot de passe, puis choisissez une phrase secrète pour chiffrer le fichier.",
+                           confirm_new=True, verify=self._verify_pw, new_label="Phrase secrète de l'export (8 caractères minimum)")
+        if not p.exec():
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Enregistrer l'historique", "ldc-historique.ldchistory", "Historique LDC (*.ldchistory)")
+        if path:
+            names = {c["id"]: (c["alias"] or c["name"]) for c in self.engine.contacts()}
+            n = export_history(self.engine.db, self.engine.identity, Path(path), p.new_value, names)
+            self.status_message.emit(f"{n} message(s) exportés (chiffrés)", "ok")
 
     def _import(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Choisir une sauvegarde", "", "Sauvegarde LDC (*.ldcbackup)")

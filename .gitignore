@@ -13,3 +13,7 @@ dist/
 *.ldcbackup
 profiles/
 .venv/
+dist/
+RELEASE_SIGNING_KEY*
+*.key
+.update-backup-*/

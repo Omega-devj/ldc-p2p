@@ -48,6 +48,7 @@ class ContactsPage(QWidget):
         pl.addWidget(self.scroll, 1)
         ctrl.contacts_changed.connect(self.refresh)
         ctrl.presence_changed.connect(self.refresh)
+        ctrl.connection.connect(lambda *_: self.refresh())
         self.refresh()
 
     def _clear(self) -> None:
@@ -71,6 +72,11 @@ class ContactsPage(QWidget):
         nm = label(c["alias"] or c["name"], "h3")
         col.addWidget(nm)
         col.addWidget(label(subtitle, "faint"))
+        twins = self.engine.lookalikes(c["id"]) if c["state"] in ("pending_in", "accepted") else []
+        if twins:
+            warn = label("⚠ Même nom que « " + (twins[0]["alias"] or twins[0]["name"]) + " » mais identifiant différent — vérifiez avant d'accepter.", "faint", wrap=True)
+            warn.setStyleSheet("color: #FBBF24;")
+            col.addWidget(warn)
         h.addLayout(col, 1)
         if c["verified"]:
             sh = label("")
@@ -106,7 +112,10 @@ class ContactsPage(QWidget):
             for c in groups["pending_out"]:
                 cancel = button("Annuler", "ghost")
                 cancel.clicked.connect(lambda _=False, i=c["id"]: self.ctrl.run(e.cancel_request(i)))
-                self.rows.addWidget(self._row(c, [cancel], "demande envoyée · " + c["id"]))
+                st = {"sent": "demande remise au serveur — en attente de réponse",
+                      "queued": "demande en cours d'envoi…",
+                      "offline": "⚠ demande en attente : vous n'êtes pas connecté au serveur"}[e.request_status(c["id"])]
+                self.rows.addWidget(self._row(c, [cancel], st + " · " + c["id"]))
         if groups["blocked"]:
             self._section("BLOQUÉS", len(groups["blocked"]))
             for c in groups["blocked"]:

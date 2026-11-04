@@ -11,12 +11,12 @@ from . import icons, theme
 from .widgets.glass import AuroraBackground, GlassPanel, Switch, divider, label
 
 
-def button(text: str, kind: str = "", icon: str | None = None, color: str = "#F3F3F8") -> QPushButton:
+def button(text: str, kind: str = "", icon: str | None = None, color: str | None = None) -> QPushButton:
     b = QPushButton(text)
     if kind:
         b.setProperty("kind", kind)
     if icon:
-        b.setIcon(icons.icon(icon, color, 18))
+        b.setIcon(icons.icon(icon, color or theme.ink_hex(), 18))
         b.setIconSize(QSize(18, 18))
     b.setCursor(Qt.PointingHandCursor)
     return b
@@ -56,11 +56,12 @@ class GlassDialog(QDialog):
 
 
 class AddContactDialog(GlassDialog):
-    def __init__(self, parent, my_code: str, my_name: str, my_id: str):
+    def __init__(self, parent, my_code: str, my_name: str, my_id: str, prefill: str = ""):
         super().__init__(parent, "Ajouter un contact",
                          "Échangez vos codes d'invitation par un canal de confiance. Un code ne contient ni adresse IP ni mot de passe.", 560)
         self.code_value: str | None = None
         self.greeting_value = ""
+        self.err = label("", "error", wrap=True)
         self.body.addWidget(label("MON CODE D'INVITATION", "section"))
         mine = GlassPanel(radius=14)
         ml = QVBoxLayout(mine)
@@ -75,11 +76,35 @@ class AddContactDialog(GlassDialog):
         ml.addWidget(self.mine)
         cp = button("Copier mon code", "", "copy")
         cp.clicked.connect(lambda: (copy_text(my_code), cp.setText("Copié ✓"), QTimer.singleShot(1600, lambda: cp.setText("Copier mon code"))))
-        ml.addWidget(cp, 0, Qt.AlignLeft)
+        qrb = button("Afficher en QR code", "", "image")
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.hide()
+
+        def toggle_qr() -> None:
+            from .qr import qr_pixmap
+            if self.qr_label.isVisible():
+                self.qr_label.hide()
+                qrb.setText("Afficher en QR code")
+            else:
+                pm = qr_pixmap(my_code, 4)
+                if pm is None:
+                    self.err.setText("QR code indisponible (bibliothèque segno manquante).")
+                    return
+                self.qr_label.setPixmap(pm)
+                self.qr_label.show()
+                qrb.setText("Masquer le QR code")
+        qrb.clicked.connect(toggle_qr)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(cp)
+        btn_row.addWidget(qrb)
+        btn_row.addStretch(1)
+        ml.addLayout(btn_row)
+        ml.addWidget(self.qr_label)
         self.body.addWidget(mine)
         self.body.addWidget(divider())
         self.body.addWidget(label("AJOUTER QUELQU'UN", "section"))
-        self.code = QPlainTextEdit()
+        self.code = QPlainTextEdit(prefill)
         self.code.setPlaceholderText("Collez ici le code d'invitation reçu (ldc1:…)")
         self.code.setFixedHeight(70)
         self.body.addWidget(self.code)
@@ -87,7 +112,6 @@ class AddContactDialog(GlassDialog):
         self.greet.setPlaceholderText("Message d'accompagnement (facultatif)")
         self.greet.setMaxLength(120)
         self.body.addWidget(self.greet)
-        self.err = label("", "error", wrap=True)
         self.body.addWidget(self.err)
         cancel, ok = button("Annuler", "ghost"), button("Envoyer la demande", "primary", "user-plus", "#FFFFFF")
         cancel.clicked.connect(self.reject)
@@ -344,6 +368,8 @@ class DiagnosticsDialog(GlassDialog):
             self.rows.addWidget(self._row(True, "Serveur de rendez-vous", f"Connecté à {s.server_host}:{s.server_port}" + (" (TLS)" if s.server_tls else " (sans TLS : métadonnées visibles sur le réseau)") + f". Votre adresse vue par le serveur : {e.relay.observed_ip}."))
         else:
             err = (e.relay.last_error if e.relay else None) or "en cours de connexion…"
+            from ..network.errors import explain_error
+            err = explain_error(err, s.server_tls)
             self.rows.addWidget(self._row(False, "Serveur de rendez-vous", f"Injoignable ({s.server_host}:{s.server_port}) : {err}. Vos messages sont conservés et partiront à la reconnexion."))
         if e.direct:
             self.rows.addWidget(self._row(True, "Connexions directes", f"À l'écoute sur le port {e.direct.port}. Fonctionne sur un même réseau local, en IPv6 ou avec une redirection de port."))
@@ -355,3 +381,44 @@ class DiagnosticsDialog(GlassDialog):
         for c in e.contacts({"accepted"}):
             mode = "direct" if e.is_direct(c["id"]) else ("via le relais" if e.server_online.get(c["id"]) else "hors ligne")
             self.rows.addWidget(self._row(mode != "hors ligne", c["alias"] or c["name"], f"Joignable : {mode}."))
+
+
+class MessageInfoDialog(GlassDialog):
+    """Statut de remise message par message (utile dans les groupes)."""
+
+    LABELS = {"pending": ("En attente", "#FBBF24"), "sent": ("Envoyé au serveur", "#8E8EA0"), "delivered": ("Distribué", "#34D399"), "read": ("Lu", "#67E8F9")}
+
+    def __init__(self, parent, text: str, rows: list[tuple[str, str]]):
+        super().__init__(parent, "Infos du message", "", 460)
+        self.body.addWidget(label(text[:200] + ("…" if len(text) > 200 else ""), "muted", wrap=True))
+        for name, state in rows:
+            r = QHBoxLayout()
+            r.addWidget(label(name), 1)
+            lab, col = self.LABELS.get(state, (state, "#8E8EA0"))
+            l = label(lab)
+            l.setStyleSheet(f"color: {col}; font-weight: 600;")
+            r.addWidget(l)
+            self.body.addLayout(r)
+        close = button("Fermer", "primary")
+        close.clicked.connect(self.accept)
+        self.buttons(close)
+
+
+class PreviewSendDialog(GlassDialog):
+    """Confirmation avant d'envoyer des fichiers déposés ou une image collée (jamais d'envoi accidentel)."""
+
+    def __init__(self, parent, title: str, lines: list[str], pixmap=None):
+        super().__init__(parent, title, "", 460)
+        if pixmap is not None:
+            lab = QLabel()
+            lab.setPixmap(pixmap.scaled(380, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            lab.setAlignment(Qt.AlignCenter)
+            self.body.addWidget(lab)
+        for ln in lines[:6]:
+            self.body.addWidget(label(ln, "muted"))
+        if len(lines) > 6:
+            self.body.addWidget(label(f"… et {len(lines) - 6} autre(s)", "faint"))
+        cancel, ok = button("Annuler", "ghost"), button("Envoyer", "primary", "send", "#FFFFFF")
+        cancel.clicked.connect(self.reject)
+        ok.clicked.connect(self.accept)
+        self.buttons(cancel, ok)

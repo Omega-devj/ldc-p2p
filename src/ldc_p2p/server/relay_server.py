@@ -9,6 +9,8 @@ Les enveloppes ne sont gardées que le temps nécessaire à leur remise (TTL) et
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import logging
 import os
 import sqlite3
@@ -16,6 +18,7 @@ import ssl
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from ..crypto.e2e import EnvelopeError, validate_envelope
 from ..crypto.identity import ID_RE, PublicIdentity, derive_ldc_id, unb64, b64
@@ -109,8 +112,17 @@ class Session:
 
 class RelayServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 9443, db_path: str = ":memory:",
-                 ssl_ctx: ssl.SSLContext | None = None, limits: Limits | None = None):
+                 ssl_ctx: ssl.SSLContext | None = None, limits: Limits | None = None, *, access_token: str = "",
+                 allow_file: str | None = None, block_file: str | None = None, status_port: int | None = None,
+                 status_host: str = "127.0.0.1"):
         self.host, self.port, self.ssl_ctx = host, port, ssl_ctx
+        self.access_token = access_token          # serveur privé : jeton partagé exigé à la connexion
+        self.allow_file, self.block_file = allow_file, block_file   # listes d'identifiants autorisés / d'adresses IP bloquées
+        self.status_port, self.status_host = status_port, status_host
+        self.started_at = time.time()
+        self.stats = {"connections_total": 0, "denied": 0, "relayed": 0}
+        self._status_server = None
+        self._list_cache: dict[str, tuple[float, set[str]]] = {}
         self.limits = limits or Limits()
         self.mailbox = Mailbox(db_path, self.limits)
         self.sessions: dict[str, Session] = {}
@@ -124,6 +136,9 @@ class RelayServer:
         self._server = await asyncio.start_server(self._handle, self.host, self.port, ssl=self.ssl_ctx)
         self.port = self._server.sockets[0].getsockname()[1]
         self._prune_task = asyncio.create_task(self._prune_loop(), name="mailbox-prune")
+        if self.status_port is not None:
+            self._status_server = await asyncio.start_server(self._status, self.status_host, self.status_port)
+            self.status_port = self._status_server.sockets[0].getsockname()[1]
         log.info("Serveur LDC en écoute sur %s:%s (TLS=%s)", self.host, self.port, bool(self.ssl_ctx))
 
     async def stop(self) -> None:
@@ -131,6 +146,8 @@ class RelayServer:
             self._prune_task.cancel()
         if self._server:
             self._server.close()
+        if self._status_server:
+            self._status_server.close()
         for s in list(self.sessions.values()):
             s.close()
         if self._server:
@@ -147,10 +164,52 @@ class RelayServer:
             if n:
                 log.info("Boîte aux lettres : %d enveloppes expirées supprimées", n)
 
+    # -- listes d'accès et statut --------------------------------------------------------------
+    def _read_list(self, path: str | None) -> set[str] | None:
+        """Relit un fichier (une valeur par ligne, # = commentaire) seulement s'il a changé."""
+        if not path:
+            return None
+        try:
+            mtime = Path(path).stat().st_mtime
+            cached = self._list_cache.get(path)
+            if cached and cached[0] == mtime:
+                return cached[1]
+            values = {ln.split("#")[0].strip() for ln in Path(path).read_text("utf-8").splitlines()} - {""}
+            self._list_cache[path] = (mtime, values)
+            return values
+        except OSError:
+            return set() if path == self.allow_file else None  # liste d'invités illisible : on refuse tout (échec sûr)
+
+    def status_snapshot(self) -> dict:
+        row = self.mailbox.db.execute("SELECT COUNT(*), COALESCE(SUM(size),0) FROM mail").fetchone()
+        return {"status": "ok", "uptime_s": int(time.time() - self.started_at), "connections": len(self.sessions),
+                "mailbox_messages": row[0], "mailbox_bytes": row[1], "private": bool(self.access_token or self.allow_file),
+                "tls": bool(self.ssl_ctx), **self.stats}
+
+    async def _status(self, reader, writer) -> None:
+        """Mini-page de statut (JSON) : aucun identifiant, aucune adresse, aucun contenu."""
+        try:
+            line = await asyncio.wait_for(reader.readline(), 3)
+            ok = line.startswith((b"GET /status", b"GET /healthz", b"GET / "))
+            body = json.dumps(self.status_snapshot() if ok else {"error": "not found"}).encode()
+            writer.write(b"HTTP/1.0 %s\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: %d\r\n\r\n%s"
+                         % (b"200 OK" if ok else b"404 Not Found", len(body), body))
+            await writer.drain()
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
     # -- connexion -----------------------------------------------------------------
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername") or ("?", 0)
         ip = str(peer[0])
+        blocked = self._read_list(self.block_file)
+        if blocked and ip in blocked:
+            self.stats["denied"] += 1
+            writer.close()
+            return
+        self.stats["connections_total"] += 1
         if len(self.sessions) >= self.limits.max_connections or self.ip_counts[ip] >= self.limits.max_per_ip:
             writer.close()
             return
@@ -187,6 +246,13 @@ class RelayServer:
                 raise ValueError
         except (KeyError, ValueError, TypeError):
             await write_frame(writer, {"t": "error", "reason": "auth"})
+            writer.close()
+            return None
+        allowed = self._read_list(self.allow_file) if self.allow_file else None
+        token_ok = (not self.access_token) or hmac.compare_digest(str(msg.get("tok", "")).encode(), self.access_token.encode())
+        if not token_ok or (allowed is not None and ldc_id not in allowed):
+            self.stats["denied"] += 1
+            await write_frame(writer, {"t": "error", "reason": "denied"})
             writer.close()
             return None
         old = self.sessions.get(ldc_id)
@@ -288,6 +354,7 @@ class RelayServer:
                 return await self._ack(s, ack, "delivered")
             return await self._ack(s, ack, "offline")
         env_json = _dumps(env)
+        self.stats["relayed"] += 1
         stored = self.mailbox.put(to, env["id"], env_json)
         if stored == "full":
             return await self._ack(s, ack, "rejected", "mailbox_full")

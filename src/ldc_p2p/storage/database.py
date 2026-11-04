@@ -17,7 +17,7 @@ from ..crypto.cipher import FieldCipher
 RECEIPT_RANK = {"pending": 0, "sent": 1, "delivered": 2, "read": 3}
 _RANK_STATUS = {v: k for k, v in RECEIPT_RANK.items()}
 
-MIGRATIONS: list[str] = [
+MIGRATIONS: list = [
     """
     CREATE TABLE contacts(
         id TEXT PRIMARY KEY, name TEXT NOT NULL, alias TEXT,
@@ -58,6 +58,7 @@ MIGRATIONS: list[str] = [
         chunk_size INTEGER NOT NULL, nchunks INTEGER NOT NULL, next_idx INTEGER NOT NULL DEFAULT 0,
         path TEXT, state TEXT NOT NULL, created_at INTEGER NOT NULL);
     """,
+    "_mig3",  # réactions + chiffrement des noms de contacts/groupes (fonction Python ci-dessous)
 ]
 
 
@@ -87,13 +88,43 @@ class Database:
         for i in range(version, len(MIGRATIONS)):
             self.conn.execute("BEGIN IMMEDIATE")
             try:
-                for stmt in filter(str.strip, MIGRATIONS[i].split(";")):
-                    self.conn.execute(stmt)
+                step = MIGRATIONS[i]
+                if step == "_mig3":
+                    self._mig3()
+                else:
+                    for stmt in filter(str.strip, step.split(";")):
+                        self.conn.execute(stmt)
                 self.conn.execute(f"PRAGMA user_version={i + 1}")
                 self.conn.execute("COMMIT")
             except BaseException:
                 self.conn.execute("ROLLBACK")
                 raise
+
+    def _mig3(self) -> None:
+        c = self.conn
+        c.execute("CREATE TABLE reactions(mid TEXT NOT NULL, sender TEXT NOT NULL, emoji TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(mid, sender))")
+        for r in c.execute("SELECT id, name, alias, hint FROM contacts").fetchall():
+            c.execute("UPDATE contacts SET name=?, alias=?, hint=? WHERE id=?",
+                      (self._es(r["name"], b"c-name|" + r["id"].encode()), self._es(r["alias"], b"c-alias|" + r["id"].encode()),
+                       self._es(r["hint"], b"c-hint|" + r["id"].encode()), r["id"]))
+        for r in c.execute("SELECT gid, name, members FROM groups").fetchall():
+            c.execute("UPDATE groups SET name=?, members=? WHERE gid=?",
+                      (self._es(r["name"], b"g-name|" + r["gid"].encode()), self._es(r["members"], b"g-members|" + r["gid"].encode()), r["gid"]))
+
+    def _es(self, value, aad: bytes):
+        """Chiffre une chaîne (ou renvoie None)."""
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value
+        return self.cipher.encrypt(str(value).encode("utf-8"), aad)
+
+    def _ds(self, blob, aad: bytes):
+        if blob is None:
+            return None
+        if isinstance(blob, str):  # donnée héritée non migrée
+            return blob
+        return self.cipher.decrypt(bytes(blob), aad).decode("utf-8")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -129,24 +160,42 @@ class Database:
     def all_settings(self) -> dict[str, str]:
         return {r["key"]: r["value"] for r in self.conn.execute("SELECT key,value FROM settings")}
 
-    # -- contacts ----------------------------------------------------------------
+    # -- contacts (nom, alias et indication de serveur chiffrés au repos) -----------------------
+    def _contact(self, r: sqlite3.Row | None) -> dict | None:
+        if r is None:
+            return None
+        d = dict(r)
+        i = d["id"].encode()
+        d["name"] = self._ds(r["name"], b"c-name|" + i) or ""
+        d["alias"] = self._ds(r["alias"], b"c-alias|" + i)
+        d["hint"] = self._ds(r["hint"], b"c-hint|" + i)
+        d["sign_pk"], d["box_pk"] = bytes(r["sign_pk"]), bytes(r["box_pk"])
+        return d
+
     def put_contact(self, id: str, name: str, sign_pk: bytes, box_pk: bytes, state: str, hint: str | None = None) -> None:
+        i = id.encode()
         self.conn.execute(
             "INSERT INTO contacts(id,name,sign_pk,box_pk,state,added_at,hint) VALUES(?,?,?,?,?,?,?) "
             "ON CONFLICT(id) DO UPDATE SET name=excluded.name, hint=COALESCE(excluded.hint, hint)",
-            (id, name, sign_pk, box_pk, state, now_ms(), hint))
+            (id, self._es(name, b"c-name|" + i), sign_pk, box_pk, state, now_ms(), self._es(hint, b"c-hint|" + i)))
 
-    def get_contact(self, id: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM contacts WHERE id=?", (id,)).fetchone()
+    def get_contact(self, id: str) -> dict | None:
+        return self._contact(self.conn.execute("SELECT * FROM contacts WHERE id=?", (id,)).fetchone())
 
-    def list_contacts(self, states: Iterable[str] | None = None) -> list[sqlite3.Row]:
-        rows = self.conn.execute("SELECT * FROM contacts ORDER BY COALESCE(alias,name) COLLATE NOCASE").fetchall()
-        return [r for r in rows if states is None or r["state"] in set(states)]
+    def list_contacts(self, states: Iterable[str] | None = None) -> list[dict]:
+        wanted = None if states is None else set(states)
+        rows = [self._contact(r) for r in self.conn.execute("SELECT * FROM contacts")]
+        rows = [r for r in rows if wanted is None or r["state"] in wanted]
+        return sorted(rows, key=lambda r: (r["alias"] or r["name"]).casefold())
 
     def update_contact(self, id: str, **fields: Any) -> None:
         allowed = {"state", "verified", "alias", "last_seen", "name", "hint"}
         if not fields or not set(fields) <= allowed:
             raise ValueError("champ de contact non modifiable")
+        i = id.encode()
+        for k in ("name", "alias", "hint"):
+            if k in fields:
+                fields[k] = self._es(fields[k], f"c-{k}|".encode() + i)
         sets = ",".join(f"{k}=?" for k in fields)
         self.conn.execute(f"UPDATE contacts SET {sets} WHERE id=?", (*fields.values(), id))
 
@@ -158,6 +207,7 @@ class Database:
 
     def _delete_conv(self, c: sqlite3.Connection, conv: str) -> None:
         c.execute("DELETE FROM receipts WHERE mid IN (SELECT mid FROM messages WHERE conv=?)", (conv,))
+        c.execute("DELETE FROM reactions WHERE mid IN (SELECT mid FROM messages WHERE conv=?)", (conv,))
         c.execute("DELETE FROM messages WHERE conv=?", (conv,))
         c.execute("DELETE FROM conv_settings WHERE conv=?", (conv,))
 
@@ -165,23 +215,50 @@ class Database:
         with self.tx() as c:
             self._delete_conv(c, conv)
 
-    # -- groupes -----------------------------------------------------------------
+    # -- groupes (nom et membres chiffrés au repos) -----------------------------------------------
+    def _group(self, r: sqlite3.Row | None) -> dict | None:
+        if r is None:
+            return None
+        g = r["gid"].encode()
+        d = dict(r)
+        d["name"] = self._ds(r["name"], b"g-name|" + g) or ""
+        d["members"] = json.loads(self._ds(r["members"], b"g-members|" + g) or "[]")
+        return d
+
     def put_group(self, gid: str, name: str, owner: str, members: list[str], version: int) -> None:
+        g = gid.encode()
         self.conn.execute(
             "INSERT INTO groups(gid,name,owner,version,members,created_at) VALUES(?,?,?,?,?,?) "
             "ON CONFLICT(gid) DO UPDATE SET name=excluded.name, members=excluded.members, version=excluded.version, active=1",
-            (gid, name, owner, version, json.dumps(sorted(set(members))), now_ms()))
+            (gid, self._es(name, b"g-name|" + g), owner, version,
+             self._es(json.dumps(sorted(set(members))), b"g-members|" + g), now_ms()))
 
     def get_group(self, gid: str) -> dict | None:
-        r = self.conn.execute("SELECT * FROM groups WHERE gid=?", (gid,)).fetchone()
-        return None if r is None else {**dict(r), "members": json.loads(r["members"])}
+        return self._group(self.conn.execute("SELECT * FROM groups WHERE gid=?", (gid,)).fetchone())
 
     def list_groups(self) -> list[dict]:
-        return [{**dict(r), "members": json.loads(r["members"])}
-                for r in self.conn.execute("SELECT * FROM groups WHERE active=1 ORDER BY name COLLATE NOCASE")]
+        gs = [self._group(r) for r in self.conn.execute("SELECT * FROM groups WHERE active=1")]
+        return sorted(gs, key=lambda g: g["name"].casefold())
 
     def deactivate_group(self, gid: str) -> None:
         self.conn.execute("UPDATE groups SET active=0 WHERE gid=?", (gid,))
+
+    # -- réactions ----------------------------------------------------------------------------------
+    def set_reaction(self, mid: str, sender: str, emoji: str | None) -> None:
+        if emoji:
+            self.conn.execute("INSERT INTO reactions(mid,sender,emoji,ts) VALUES(?,?,?,?) "
+                              "ON CONFLICT(mid,sender) DO UPDATE SET emoji=excluded.emoji, ts=excluded.ts", (mid, sender, emoji, now_ms()))
+        else:
+            self.conn.execute("DELETE FROM reactions WHERE mid=? AND sender=?", (mid, sender))
+
+    def reactions_for(self, mids: list[str]) -> dict[str, dict[str, list[str]]]:
+        out: dict[str, dict[str, list[str]]] = {}
+        for i in range(0, len(mids), 500):
+            chunk = mids[i:i + 500]
+            q = ",".join("?" * len(chunk))
+            for r in self.conn.execute(f"SELECT mid, sender, emoji FROM reactions WHERE mid IN ({q}) ORDER BY ts", chunk):
+                out.setdefault(r["mid"], {}).setdefault(r["emoji"], []).append(r["sender"])
+        return out
 
     # -- messages ----------------------------------------------------------------
     def add_message(self, *, mid: str, conv: str, sender: str, direction: str, body: str | None, ts: int,
@@ -225,6 +302,7 @@ class Database:
     def delete_message(self, mid: str) -> None:
         with self.tx() as c:
             c.execute("DELETE FROM receipts WHERE mid=?", (mid,))
+            c.execute("DELETE FROM reactions WHERE mid=?", (mid,))
             c.execute("DELETE FROM messages WHERE mid=?", (mid,))
 
     def unread_mids(self, conv: str) -> list[str]:
@@ -269,6 +347,7 @@ class Database:
         with self.tx() as c:
             for r in rows:
                 c.execute("DELETE FROM receipts WHERE mid=?", (r["mid"],))
+                c.execute("DELETE FROM reactions WHERE mid=?", (r["mid"],))
                 c.execute("DELETE FROM messages WHERE mid=?", (r["mid"],))
         return [(r["mid"], r["conv"]) for r in rows]
 

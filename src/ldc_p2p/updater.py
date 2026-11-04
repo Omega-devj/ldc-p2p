@@ -27,12 +27,39 @@ class UpdateError(Exception):
     pass
 
 
+GITHUB_UPDATE_URL = "https://github.com/Omega-devj/ldc-p2p/releases/latest/download"
+ALLOWED_TOP = ("src/", "requirements.txt", "LANCER_LDC_P2P.bat", "LANCER_SERVEUR.bat", "README.md", "docs/", "deploy/", "tools/", "packaging/")
+
+
 @dataclass(frozen=True)
 class Update:
     version: str
     url: str
     sha256: str
     notes: str
+    source_url: str = ""
+    source_sha256: str = ""
+
+
+def current_version() -> str:
+    """Version réellement installée : celle gravée par le build/la mise à jour, sinon celle du paquet."""
+    try:
+        from . import _build
+        if _build.BUILD:
+            return _build.BUILD
+    except ImportError:
+        pass
+    from . import __version__
+    return __version__
+
+
+def install_root() -> Path | None:
+    """Racine d'une installation « depuis les sources » (None pour un exécutable PyInstaller)."""
+    import sys
+    if getattr(sys, "frozen", False):
+        return None
+    root = Path(__file__).resolve().parents[2]
+    return root if (root / "src" / "ldc_p2p").is_dir() else None
 
 
 def parse_version(v: str) -> tuple[int, ...]:
@@ -82,21 +109,83 @@ def check_for_update(base_url: str, current: str, public_key: bytes, fetch: Call
     sig = fetch(f"{base}/manifest.sig", 1024).decode("ascii", "ignore")
     doc = verify_manifest(manifest, sig, public_key)
     try:
-        version, url, sha, notes = str(doc["version"]), str(doc["url"]), str(doc["sha256"]).lower(), str(doc.get("notes", ""))[:2000]
+        version, notes = str(doc["version"]), str(doc.get("notes", ""))[:2000]
+        url, sha = str(doc.get("url", "")), str(doc.get("sha256", "")).lower()
+        surl, ssha = str(doc.get("source_url", "")), str(doc.get("source_sha256", "")).lower()
     except KeyError as e:
         raise UpdateError("Manifeste incomplet") from e
-    if not re.fullmatch(r"[0-9a-f]{64}", sha) or not url.lower().startswith("https://"):
-        raise UpdateError("Manifeste invalide")
-    return Update(version, url, sha, notes) if is_newer(version, current) else None
+    for u, h in ((url, sha), (surl, ssha)):
+        if u and (not u.lower().startswith("https://") or not re.fullmatch(r"[0-9a-f]{64}", h)):
+            raise UpdateError("Manifeste invalide")
+    if not (url or surl):
+        raise UpdateError("Manifeste sans fichier")
+    return Update(version, url, sha, notes, surl, ssha) if is_newer(version, current) else None
 
 
-def download_update(update: Update, dest_dir: Path, fetch: Callable[[str, int], bytes] | None = None) -> Path:
+def download_update(update: Update, dest_dir: Path, fetch: Callable[[str, int], bytes] | None = None, source: bool = False) -> Path:
     fetch = fetch or (lambda u, lim: _https_get(u, lim, timeout=120))
-    data = fetch(update.url, MAX_INSTALLER)
-    if hashlib.sha256(data).hexdigest() != update.sha256:
+    url, want = (update.source_url, update.source_sha256) if source else (update.url, update.sha256)
+    if not url:
+        raise UpdateError("Cette version ne propose pas ce type de fichier")
+    data = fetch(url, MAX_INSTALLER)
+    if hashlib.sha256(data).hexdigest() != want:
         raise UpdateError("Empreinte SHA-256 incorrecte : fichier rejeté")
     dest_dir.mkdir(parents=True, exist_ok=True)
-    name = re.sub(r"[^A-Za-z0-9._-]", "_", update.url.rsplit("/", 1)[-1]) or "ldc-p2p-setup.exe"
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", url.rsplit("/", 1)[-1]) or "ldc-p2p-update"
     out = dest_dir / name
     out.write_bytes(data)
     return out
+
+
+def apply_source_update(zip_path: Path, root: Path) -> Path:
+    """Remplace src/ (et les fichiers autorisés) par ceux de l'archive vérifiée ; sauvegarde l'ancienne version.
+    Aucun chemin sortant de la racine, aucun fichier hors liste blanche. Retourne le dossier de sauvegarde."""
+    import shutil
+    import tempfile
+    import time
+    import zipfile
+    tmp = Path(tempfile.mkdtemp(prefix="ldc-update-"))
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            names = z.namelist()
+            top = {n.split("/", 1)[0] for n in names if n.strip("/")}
+            prefix = (top.pop() + "/") if len(top) == 1 and not any(n.startswith(("src/", "requirements.txt")) for n in names) else ""
+            total = 0
+            for info in z.infolist():
+                rel = info.filename[len(prefix):] if info.filename.startswith(prefix) else info.filename
+                if not rel or rel.endswith("/"):
+                    continue
+                target = (tmp / rel).resolve()
+                if not str(target).startswith(str(tmp.resolve())) or ".." in Path(rel).parts or Path(rel).is_absolute():
+                    raise UpdateError("Archive invalide (chemin dangereux)")
+                if not rel.startswith(ALLOWED_TOP) or rel.lower().endswith((".db", ".pem", ".ldckey")):
+                    continue
+                total += info.file_size
+                if total > 200 * 1024 * 1024:
+                    raise UpdateError("Archive trop volumineuse")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(z.read(info))
+        if not (tmp / "src" / "ldc_p2p" / "__init__.py").exists():
+            raise UpdateError("Archive incomplète : src/ldc_p2p manquant")
+        backup = root / f".update-backup-{int(time.time())}"
+        backup.mkdir()
+        moved: list[str] = []
+        try:
+            for entry in tmp.iterdir():
+                dest = root / entry.name
+                if dest.exists():
+                    shutil.move(str(dest), str(backup / entry.name))
+                    moved.append(entry.name)
+                shutil.move(str(entry), str(dest))
+        except Exception:
+            for name in moved:  # restauration en cas d'échec
+                if (root / name).exists():
+                    shutil.rmtree(root / name, ignore_errors=True) if (root / name).is_dir() else (root / name).unlink()
+                shutil.move(str(backup / name), str(root / name))
+            raise
+        old = sorted(root.glob(".update-backup-*"))[:-2]  # on garde les 2 dernières sauvegardes
+        for b in old:
+            shutil.rmtree(b, ignore_errors=True)
+        return backup
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

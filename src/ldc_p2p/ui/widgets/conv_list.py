@@ -75,19 +75,19 @@ class ConvDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.State_Selected)
         hover = bool(option.state & QStyle.State_MouseOver)
         if selected:
-            p.setPen(QPen(QColor(167, 139, 250, 90), 1))
-            p.setBrush(QColor(139, 92, 246, 62))
+            p.setPen(QPen(theme.accent(1, 90), 1))
+            p.setBrush(theme.accent(0, 62))
             p.drawRoundedRect(r, 16, 16)
         elif hover:
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor(255, 255, 255, 16))
+            p.setBrush(theme.ov(16))
             p.drawRoundedRect(r, 16, 16)
         av = QRectF(r.left() + 10, r.center().y() - 22, 44, 44)
         draw_avatar(p, av, it["conv"], it["title"], group=it["kind"] == "group")
         if it["kind"] == "dm" and it["state"] == "accepted":
             col = QColor(theme.PRESENCE_COLORS.get(it["presence"], "#6B7280"))
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor("#0C0C14"))
+            p.setBrush(QColor("#F3F4FB") if theme.is_light() else QColor("#0C0C14"))
             p.drawEllipse(QPointF(av.right() - 5, av.bottom() - 5), 8, 8)
             p.setBrush(col)
             p.drawEllipse(QPointF(av.right() - 5, av.bottom() - 5), 5.5, 5.5)
@@ -97,23 +97,23 @@ class ConvDelegate(QStyledItemDelegate):
         # heure
         last = it.get("last")
         p.setFont(self.small_f)
-        p.setPen(QColor("#C4B5FD") if unread else theme.TEXT_3)
+        p.setPen(theme.accent(3) if (unread and not theme.is_light()) else (theme.accent(2) if unread else theme.TEXT_3))
         time_txt = short_time(last["ts"]) if last else ""
         tw = QFontMetrics(self.small_f).horizontalAdvance(time_txt)
         p.drawText(QRectF(right - tw, r.top() + 12, tw, 18), Qt.AlignRight | Qt.AlignVCenter, time_txt)
         # titre
         p.setFont(self.title_f)
-        p.setPen(QColor("#F3F3F8"))
+        p.setPen(theme.ink())
         tfm = QFontMetrics(self.title_f)
         icon_w = (16 if it.get("pinned") else 0) + (16 if it.get("muted") else 0)
         title = tfm.elidedText(it["title"], Qt.ElideRight, int(right - tx - tw - 10 - icon_w))
         p.drawText(QPointF(tx, r.top() + 26), title)
         ix = tx + tfm.horizontalAdvance(title) + 6
         if it.get("pinned"):
-            p.drawPixmap(int(ix), int(r.top() + 14), icons.pixmap("pin", "#8E8EA0", 12))
+            p.drawPixmap(int(ix), int(r.top() + 14), icons.pixmap("pin", theme.icon_hex(0), 12))
             ix += 16
         if it.get("muted"):
-            p.drawPixmap(int(ix), int(r.top() + 14), icons.pixmap("bell-off", "#8E8EA0", 12))
+            p.drawPixmap(int(ix), int(r.top() + 14), icons.pixmap("bell-off", theme.icon_hex(0), 12))
         # aperçu
         badge_w = 0
         if unread:
@@ -121,7 +121,7 @@ class ConvDelegate(QStyledItemDelegate):
             badge_w = max(22, QFontMetrics(self.small_f).horizontalAdvance(txt) + 14)
             br = QRectF(right - badge_w, r.bottom() - 30, badge_w, 20)
             p.setPen(Qt.NoPen)
-            p.setBrush(QColor("#8B5CF6") if not it.get("muted") else QColor(255, 255, 255, 60))
+            p.setBrush(theme.accent(0) if not it.get("muted") else theme.ov(60))
             p.drawRoundedRect(br, 10, 10)
             p.setPen(QColor("white"))
             f = QFont(self.small_f)
@@ -135,9 +135,9 @@ class ConvDelegate(QStyledItemDelegate):
         elif state == "pending_out":
             sub, col = "En attente d'acceptation…", theme.TEXT_3
         elif it.get("typing"):
-            sub, col = "écrit…", QColor("#A78BFA")
+            sub, col = "écrit…", theme.accent(1)
         else:
-            sub, col = it.get("preview", ""), (QColor(255, 255, 255, 190) if unread else theme.TEXT_2)
+            sub, col = it.get("preview", ""), (theme.ink(210) if unread else theme.TEXT_2)
         if it.get("result"):
             sub, col = it["result"], theme.TEXT_2
         p.setPen(col)

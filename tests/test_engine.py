@@ -443,3 +443,89 @@ def test_direct_candidate_filter():
     bad = ["127.0.0.1", "169.254.1.1", "224.0.0.1", "0.0.0.0", "localhost", "exemple.fr", "::1", "fe80::1"]
     assert all(e._candidate_allowed(h) for h in ok)
     assert not any(e._candidate_allowed(h) for h in bad)
+
+
+async def test_reactions_sync_toggle_and_authorization(make_node, server):
+    a, b, c = await trio(make_node, server)
+    mid = await a.engine.send_text(b.identity.id, "réagis !")
+    await wait_for(lambda: b.engine.db.get_message(mid) is not None)
+    await b.engine.react(mid, "👍")
+    await wait_for(lambda: a.engine.db.reactions_for([mid]).get(mid) == {"👍": [b.identity.id]})
+    await b.engine.react(mid, "❤️")  # remplace
+    await wait_for(lambda: a.engine.db.reactions_for([mid]).get(mid) == {"❤️": [b.identity.id]})
+    await b.engine.react(mid, "❤️")  # même emoji : retire
+    await wait_for(lambda: a.engine.db.reactions_for([mid]).get(mid) is None)
+    with pytest.raises(EngineError):
+        await b.engine.react(mid, "💩")
+    # Carol (étrangère à cette conversation) ne peut pas réagir
+    forged = e2e.seal(c.identity, a.identity.public, {"t": "react", "m": mid, "e": "👍"})
+    await a.engine._handle_envelope(forged, "relay")
+    assert a.engine.db.reactions_for([mid]).get(mid) is None
+
+
+async def test_mentions_and_group_reaction(make_node, server):
+    a, b, c = await trio(make_node, server)
+    conv = await a.engine.create_group("G", [b.identity.id, c.identity.id])
+    await wait_for(lambda: b.engine.db.get_group(conv[4:]) and c.engine.db.get_group(conv[4:]))
+    mid = await a.engine.send_text(conv, "salut @bob", mentions=[b.identity.id, "pas-un-id"])
+    await wait_for(lambda: b.engine.db.get_message(mid) is not None)
+    assert b.engine.db.get_message(mid)["extra"] == {"men": [b.identity.id]}
+    await c.engine.react(mid, "🎉")
+    await wait_for(lambda: b.engine.db.reactions_for([mid]).get(mid) == {"🎉": [c.identity.id]})
+
+
+async def test_lookalike_warning(make_node, server):
+    a, b = await pair(make_node, server)
+    from ldc_p2p.crypto.identity import Identity
+    fake = Identity.generate("bob")  # même pseudo que le vrai Bob, autre identifiant
+    code = e2e.encode_card(e2e.make_card(fake))
+    pub, look = a.engine.preview_card(code)
+    assert pub.id == fake.id and [c["id"] for c in look] == [b.identity.id]
+
+
+async def test_cancel_file_both_sides(make_node, server, tmp_path):
+    import os
+    a, b = await pair(make_node, server)
+    f = tmp_path / "gros.bin"
+    f.write_bytes(os.urandom(2_000_000))
+    mid = await a.engine.send_file(b.identity.id, f)
+    await wait_for(lambda: b.engine.transfer(mid) is not None)
+    await b.engine.accept_file(mid)
+    await wait_for(lambda: b.engine.transfer(mid)["next_idx"] > 0)
+    await a.engine.cancel_file(mid)
+    await wait_for(lambda: b.engine.transfer(mid)["state"] == "cancelled")
+    assert a.engine.transfer(mid)["state"] == "cancelled"
+    assert not list((tmp_path / "dl-bob").glob(".ldc-*.part"))
+
+
+async def test_direct_toggle_applies_live(make_node, server):
+    a = await make_node("alice", server.port, direct=False)
+    assert a.engine.direct is None
+    await a.engine.set_direct_enabled(True)
+    assert a.engine.direct is not None and a.engine.direct.port > 0
+    await a.engine.set_direct_enabled(False)
+    assert a.engine.direct is None
+
+
+def test_migration_from_v2_plaintext_names(tmp_path):
+    import os, sqlite3
+    from ldc_p2p.crypto.cipher import FieldCipher
+    from ldc_p2p.storage import database as dbm
+    key = os.urandom(32)
+    path = tmp_path / "old.db"
+    c = sqlite3.connect(path)
+    for stmt in filter(str.strip, dbm.MIGRATIONS[0].split(";")):
+        c.execute(stmt)
+    for stmt in filter(str.strip, dbm.MIGRATIONS[1].split(";")):
+        c.execute(stmt)
+    c.execute("PRAGMA user_version=2")
+    c.execute("INSERT INTO contacts(id,name,alias,sign_pk,box_pk,state,added_at) VALUES('LDC-AAAAAA-BBBBBB-CCCCCC-DDDDDD','Camille','Cam',x'00',x'00','accepted',1)")
+    c.execute("INSERT INTO groups(gid,name,owner,members,created_at) VALUES('0123456789abcdef','Famille','o','[\"a\",\"b\"]',1)")
+    c.commit(); c.close()
+    d = dbm.Database(path, FieldCipher(key))
+    assert d.schema_version == len(dbm.MIGRATIONS)
+    assert d.get_contact("LDC-AAAAAA-BBBBBB-CCCCCC-DDDDDD")["name"] == "Camille"
+    assert d.get_group("0123456789abcdef")["members"] == ["a", "b"]
+    d.close()
+    raw = path.read_bytes() + (tmp_path / "old.db-wal").read_bytes() if (tmp_path / "old.db-wal").exists() else path.read_bytes()
+    assert b"Camille" not in raw and b"Famille" not in raw

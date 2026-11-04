@@ -4,8 +4,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import tempfile
 from PySide6.QtCore import QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
                                QScrollArea, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -13,7 +14,8 @@ from ...crypto.e2e import now_ms
 from ...engine.files import DANGEROUS_EXT
 from .. import icons, theme
 from ..controller import UiController
-from ..dialogs import (ConfirmDialog, PickMembersDialog, SafetyDialog, TextPrompt, button, copy_text)
+from ..dialogs import (ConfirmDialog, MessageInfoDialog, PickMembersDialog, PreviewSendDialog, SafetyDialog, TextPrompt, button, copy_text)
+from ...engine.core import ALLOWED_REACTIONS
 from ..widgets.chat_view import ChatView, build_items
 from ..widgets.composer import Composer
 from ..widgets.conv_list import ConvList, preview_of
@@ -44,8 +46,72 @@ class ChatsPage(QWidget):
         c.file_state.connect(self._on_file_state)
         c.file_progress.connect(self._on_file_progress)
         c.connection.connect(lambda *_: self._update_banner())
+        self.setAcceptDrops(True)
+        self.unseen_below = 0
+        self.scroll_btn = QPushButton(self.view.viewport())
+        self.scroll_btn.setProperty("kind", "primary")
+        self.scroll_btn.setIcon(icons.icon("arrow-up", "#FFFFFF", 18))
+        self.scroll_btn.setFixedSize(46, 46)
+        self.scroll_btn.setStyleSheet("QPushButton { border-radius: 23px; padding: 0; }")
+        self.scroll_btn.setIconSize(QSize(18, 18))
+        self.scroll_btn.setToolTip("Aller aux derniers messages")
+        self.scroll_btn.clicked.connect(self._jump_bottom)
+        self.scroll_btn.hide()
+        self.view.scrolled.connect(self._update_scroll_btn)
+        self.view.viewport().installEventFilter(self)
         self.refresh_list()
         self._show_conv()
+
+    def eventFilter(self, obj, ev):
+        from PySide6.QtCore import QEvent
+        if obj is self.view.viewport() and ev.type() == QEvent.Resize:
+            self.scroll_btn.move(ev.size().width() - 66, ev.size().height() - 66)
+        return False
+
+    def _update_scroll_btn(self) -> None:
+        far = not self.view.at_bottom()
+        if not far:
+            self.unseen_below = 0
+        self.scroll_btn.setIcon(icons.icon("arrow-up", "#FFFFFF", 18) if True else QIcon())
+        self.scroll_btn.setText(str(self.unseen_below) if self.unseen_below else "")
+        self.scroll_btn.setVisible(far)
+        self.scroll_btn.move(self.view.viewport().width() - 66, self.view.viewport().height() - 66)
+
+    def _jump_bottom(self) -> None:
+        self.view.scroll_bottom()
+        self.unseen_below = 0
+        QTimer.singleShot(80, self._update_scroll_btn)
+
+    # -- glisser-déposer et images collées -----------------------------------------------------------------
+    def dragEnterEvent(self, e) -> None:
+        if e.mimeData().hasUrls() and self.conv and not self._is_group():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e) -> None:
+        self._offer_files([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
+
+    def _offer_files(self, paths: list[str]) -> None:
+        import os
+        paths = [p for p in paths if os.path.isfile(p)][:5]
+        if not paths or not self.conv:
+            return
+        if self._is_group():
+            self.ctrl.error.emit("Le partage de fichiers est disponible dans les conversations privées.")
+            return
+        lines = [f"{os.path.basename(p)} — {os.path.getsize(p) / 1048576:.1f} Mo" for p in paths]
+        if PreviewSendDialog(self, f"Envoyer {len(paths)} fichier(s) à {self.h_title.text()} ?", lines).exec():
+            for p in paths:
+                self.ctrl.run(self.engine.send_file(self.conv, p))
+
+    def _on_image_pasted(self, img) -> None:
+        if not self.conv or self._is_group():
+            self.ctrl.error.emit("Collez une image dans une conversation privée pour l'envoyer.")
+            return
+        from PySide6.QtGui import QPixmap
+        path = Path(tempfile.mkdtemp(prefix="ldc-img-")) / f"image-{now_ms()}.png"
+        img.save(str(path), "PNG")
+        if PreviewSendDialog(self, f"Envoyer cette image à {self.h_title.text()} ?", [path.name], QPixmap.fromImage(img)).exec():
+            self.ctrl.run(self.engine.send_file(self.conv, str(path)))
 
     # ------------------------------------------------------------------ construction
     def _build(self) -> None:
@@ -69,7 +135,7 @@ class ChatsPage(QWidget):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Rechercher messages et contacts")
         self.search.setClearButtonEnabled(True)
-        self.search.addAction(icons.icon("search", "#8E8EA0", 18), QLineEdit.LeadingPosition)
+        self.search.addAction(icons.icon("search", theme.icon_hex(0), 18), QLineEdit.LeadingPosition)
         self.search.textChanged.connect(lambda: self.refresh_list())
         sw = QHBoxLayout()
         sw.setContentsMargins(0, 0, 6, 0)
@@ -115,7 +181,7 @@ class ChatsPage(QWidget):
     def _tool(self, icon: str, tip: str) -> QPushButton:
         b = QPushButton()
         b.setProperty("kind", "icon")
-        b.setIcon(icons.icon(icon, "#C9C9D6", 20))
+        b.setIcon(icons.icon(icon, theme.icon_hex(1), 20))
         b.setIconSize(QSize(20, 20))
         b.setFixedSize(38, 38)
         b.setToolTip(tip)
@@ -169,7 +235,7 @@ class ChatsPage(QWidget):
         v.addWidget(divider())
         self.banner = QLabel()
         self.banner.setWordWrap(True)
-        self.banner.setStyleSheet("background: rgba(251,191,36,0.12); color: #FCD34D; padding: 8px 22px; font-size: 9pt;")
+        self.banner.setStyleSheet("background: rgba(251,191,36,0.14); color: %s; padding: 8px 22px; font-size: 9pt;" % ("#92400E" if theme.is_light() else "#FCD34D"))
         self.banner.hide()
         v.addWidget(self.banner)
         self.view = ChatView()
@@ -188,6 +254,8 @@ class ChatsPage(QWidget):
         # signaux
         self.composer.send_text.connect(self._send)
         self.composer.attach.connect(self._attach)
+        self.composer.image_pasted.connect(self._on_image_pasted)
+        self.composer.files_dropped.connect(self._offer_files)
         self.composer.typing.connect(self._typing)
         self.view.action.connect(self._on_action)
         self.view.link.connect(self._open_link)
@@ -243,6 +311,7 @@ class ChatsPage(QWidget):
     # ------------------------------------------------------------------ ouverture
     def open_conv(self, conv: str, focus_mid: str | None = None) -> None:
         self.conv, self.focus_mid = conv, focus_mid
+        self.view.highlight = self.search.text().strip() if focus_mid else ""
         self._show_conv()
         self.list.current_conv = conv
         self.list.reselect()
@@ -281,12 +350,19 @@ class ChatsPage(QWidget):
         limit = 300 if self.focus_mid else 80
         msgs = self.engine.messages(self.conv, limit=limit)
         self.loaded_all = len(msgs) < limit
-        items = build_items(msgs, self._name_of, self._is_group(), self._transfers(msgs), quote_of=self._quote_of)
+        unread = self.engine.db.unread_mids(self.conv)
+        items = build_items(msgs, self._name_of, self._is_group(), self._transfers(msgs), quote_of=self._quote_of,
+                            reactions=self.engine.db.reactions_for([m["mid"] for m in msgs]), me=self.engine.me,
+                            new_from=unread[0] if unread and unread[0] in {m["mid"] for m in msgs} else None)
         self.view.set_items(items)
+        self.unseen_below = 0
         if self.focus_mid:
-            row = self.view.model_.row_of(self.focus_mid)
-            if row >= 0:
-                QTimer.singleShot(60, lambda: self.view.scrollTo(self.view.model_.index(row), self.view.PositionAtCenter))
+            self.view.scroll_to_mid(self.focus_mid)
+        elif unread and self.view.model_.row_of("new-marker") >= 0:
+            self.view.scroll_to_mid("new-marker", center=False)
+        else:
+            self.view.scroll_bottom()
+        QTimer.singleShot(200, self._update_scroll_btn)
         self._configure_composer(s)
         self._update_banner()
         self._mark_read()
@@ -322,6 +398,11 @@ class ChatsPage(QWidget):
         else:
             self.composer.set_enabled_state(True)
         self.composer.btn_attach.setVisible(s["kind"] == "dm")
+        if s["kind"] == "group":
+            g = self.engine.db.get_group(s["conv"][4:])
+            self.composer.set_members([(m, self.engine.display_name(m)) for m in (g["members"] if g else []) if m != self.engine.me])
+        else:
+            self.composer.set_members([])
 
     def _update_banner(self) -> None:
         e = self.engine
@@ -369,12 +450,16 @@ class ChatsPage(QWidget):
         stick = self.view.at_bottom() or direction == "out"
         items = build_items([m], self._name_of, self._is_group(), self._transfers([m]),
                             prev_ts=prev["msg"]["ts"] if prev else None,
-                            quote_of=self._quote_of, prev_sender=prev["sender"] if prev else None)
+                            quote_of=self._quote_of, prev_sender=prev["sender"] if prev else None,
+                            reactions=self.engine.db.reactions_for([mid]), me=self.engine.me)
         if prev is None and model.items and model.items[-1]["type"] == "date":
             items = [i for i in items if i["type"] != "date"]
         model.append(items)
         if stick:
             self.view.scroll_bottom()
+        else:
+            self.unseen_below += 1
+            QTimer.singleShot(0, self._update_scroll_btn)
         if direction == "in":
             self._mark_read()
 
@@ -382,7 +467,8 @@ class ChatsPage(QWidget):
         m = self.engine.db.get_message(mid)
         if m and self.view.model_.row_of(mid) >= 0:
             self.view.delegate.clear_cache()
-            self.view.model_.replace(mid, msg=m, transfer=self.engine.transfer(mid) if m["kind"] == "file" else None)
+            self.view.model_.replace(mid, msg=m, transfer=self.engine.transfer(mid) if m["kind"] == "file" else None,
+                                     reactions=self.engine.db.reactions_for([mid]).get(mid, {}))
 
     def _on_status(self, mid: str, status: str) -> None:
         self._refresh_item(mid)
@@ -452,7 +538,8 @@ class ChatsPage(QWidget):
         if mode == "edit" and target:
             self.ctrl.run(self.engine.edit_message(target, text), on_success=sent)
         else:
-            self.ctrl.run(self.engine.send_text(self.conv, text, reply_to=target if mode == "reply" else None), on_success=sent)
+            self.ctrl.run(self.engine.send_text(self.conv, text, reply_to=target if mode == "reply" else None,
+                                                mentions=self.composer.mentions_in(text)), on_success=sent)
 
     def _typing(self) -> None:
         import time
@@ -483,7 +570,8 @@ class ChatsPage(QWidget):
             return
         sb = self.view.verticalScrollBar()
         before_max, before_val = sb.maximum(), sb.value()
-        items = build_items(older, self._name_of, self._is_group(), self._transfers(older), quote_of=self._quote_of)
+        items = build_items(older, self._name_of, self._is_group(), self._transfers(older), quote_of=self._quote_of,
+                            reactions=self.engine.db.reactions_for([m["mid"] for m in older]), me=self.engine.me)
         if model.items and model.items[0]["type"] == "date" and items and items[-1].get("mid") == model.items[0].get("mid"):
             model.remove(model.items[0]["mid"])
         model.prepend(items)
@@ -498,6 +586,10 @@ class ChatsPage(QWidget):
             self.ctrl.run(e.decline_file(mid))
         elif name == "retry":
             self.ctrl.run(e.retry_message(mid))
+        elif name == "cancel":
+            self.ctrl.run(e.cancel_file(mid))
+        elif name.startswith("react:"):
+            self.ctrl.run(e.react(mid, name[6:]))
         elif name == "open":
             tr = e.transfer(mid)
             if tr and tr.get("path") and os.path.exists(tr["path"]):
@@ -520,19 +612,34 @@ class ChatsPage(QWidget):
         if not m:
             return
         menu = QMenu(self)
-        menu.addAction(icons.icon("copy", "#C9C9D6", 16), "Copier le texte", lambda: copy_text(m["body"] or ""))
+        sel = self.view.selected_text()
+        if sel:
+            menu.addAction(icons.icon("copy", theme.icon_hex(1), 16), "Copier la sélection", lambda: copy_text(sel))
+        menu.addAction(icons.icon("copy", theme.icon_hex(1), 16), "Copier le message", lambda: copy_text(m["body"] or ""))
         if self.composer.btn_send.isEnabled():
-            menu.addAction(icons.icon("reply", "#C9C9D6", 16), "Répondre",
+            rm = menu.addMenu(icons.icon("smile", theme.icon_hex(1), 16), "Réagir")
+            for em in ALLOWED_REACTIONS:
+                rm.addAction(em, lambda em=em: self.ctrl.run(self.engine.react(mid, em)))
+        if self.composer.btn_send.isEnabled():
+            menu.addAction(icons.icon("reply", theme.icon_hex(1), 16), "Répondre",
                            lambda: self.composer.start_reply(mid, "Vous" if m["direction"] == "out" else self._name_of(m["sender"]), m["body"] or ""))
         if m["direction"] == "out" and m["kind"] == "text":
-            menu.addAction(icons.icon("edit", "#C9C9D6", 16), "Modifier", lambda: self.composer.start_edit(mid, m["body"] or ""))
+            menu.addAction(icons.icon("edit", theme.icon_hex(1), 16), "Modifier", lambda: self.composer.start_edit(mid, m["body"] or ""))
         if m["status"] == "failed":
-            menu.addAction(icons.icon("refresh", "#C9C9D6", 16), "Réessayer l'envoi", lambda: self.ctrl.run(self.engine.retry_message(mid)))
+            menu.addAction(icons.icon("refresh", theme.icon_hex(1), 16), "Réessayer l'envoi", lambda: self.ctrl.run(self.engine.retry_message(mid)))
+        if m["direction"] == "out":
+            menu.addAction(icons.icon("info", theme.icon_hex(1), 16), "Infos de remise", lambda: self._show_info(mid))
         menu.addSeparator()
         menu.addAction(icons.icon("trash", "#F87171", 16), "Supprimer pour moi", lambda: self.ctrl.run(self.engine.delete_message(mid)))
         if m["direction"] == "out" and m["kind"] != "system":
             menu.addAction(icons.icon("trash", "#F87171", 16), "Supprimer pour tous", lambda: self._confirm_delete_all(mid))
         menu.exec(pos)
+
+    def _show_info(self, mid: str) -> None:
+        m = self.engine.db.get_message(mid)
+        if m:
+            rows = [(self.engine.display_name(p), st) for p, st in self.engine.db.receipts(mid).items()]
+            MessageInfoDialog(self, m["body"] or "", rows).exec()
 
     def _confirm_delete_all(self, mid: str) -> None:
         if ConfirmDialog(self, "Supprimer pour tous ?", "Le message sera supprimé chez vos correspondants s'ils sont en ligne ou à leur prochaine connexion. "
@@ -588,7 +695,7 @@ class ChatsPage(QWidget):
         if s["kind"] == "dm":
             c = e.db.get_contact(s["conv"])
             idl = label(s["conv"], "mono")
-            idl.setStyleSheet("font-size: 8pt; color: rgba(235,235,245,0.55);")
+            idl.setStyleSheet("font-size: 8pt; color: %s;" % ("rgba(20,20,40,0.6)" if theme.is_light() else "rgba(235,235,245,0.55)"))
             idl.setAlignment(Qt.AlignCenter)
             idl.setTextInteractionFlags(Qt.TextSelectableByMouse)
             L.addWidget(idl)

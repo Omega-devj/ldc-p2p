@@ -4,19 +4,24 @@ from __future__ import annotations
 import sys
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QMenu, QPushButton, QStackedWidget, QSystemTrayIcon, QVBoxLayout,
-                               QWidget)
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QShortcut
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLineEdit, QMenu, QPushButton, QStackedWidget, QSystemTrayIcon,
+                               QVBoxLayout, QWidget)
 
 from ..engine.core import ChatEngine
 from ..profile import Profile
 from . import icons, theme
 from .controller import UiController
-from .dialogs import AddContactDialog, DiagnosticsDialog, NewGroupDialog
+import asyncio
+from ..crypto.identity import InvalidPassword, Keystore
+from . import sounds, winint
+from .activity import ActivityMonitor
+from .update_manager import UpdateManager
+from .dialogs import AddContactDialog, ConfirmDialog, DiagnosticsDialog, NewGroupDialog, button
 from .pages.chats import ChatsPage
 from .pages.contacts import ContactsPage
 from .pages.settings import SettingsPage
-from .widgets.glass import AuroraBackground, Avatar, GlassPanel, PresenceDot, Toast
+from .widgets.glass import AuroraBackground, Avatar, GlassPanel, PresenceDot, Toast, label
 
 PAGE_CHATS, PAGE_CONTACTS, PAGE_SETTINGS = range(3)
 
@@ -36,7 +41,7 @@ class NavButton(QPushButton):
         self.toggled.connect(lambda _: self._sync())
 
     def _sync(self) -> None:
-        self.setIcon(icons.icon(self.icon_name, "#E9E3FF" if self.isChecked() else "#9A9AAE", 24, 1.9))
+        self.setIcon(icons.icon(self.icon_name, theme.accent_hex(3 if not theme.is_light() else 2) if self.isChecked() else theme.icon_hex(0), 24, 1.9))
 
     def set_badge(self, n: int) -> None:
         self.badge = n
@@ -77,9 +82,64 @@ def apply_windows_backdrop(widget: QWidget) -> bool:
         return False
 
 
+class LockOverlay(AuroraBackground):
+    """Écran de verrouillage : masque tout le contenu jusqu'à la saisie du mot de passe du profil."""
+    unlocked = Signal()
+
+    def __init__(self, parent: QWidget, keystore_path):
+        super().__init__(parent)
+        self.ks = keystore_path
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignCenter)
+        card = GlassPanel(radius=26, strong=True)
+        card.setFixedWidth(400)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(34, 30, 34, 28)
+        cl.setSpacing(12)
+        logo = label("")
+        logo.setPixmap(icons.logo_pixmap(64))
+        logo.setAlignment(Qt.AlignCenter)
+        cl.addWidget(logo)
+        t = label("LDC P2P est verrouillé", "h2")
+        t.setAlignment(Qt.AlignCenter)
+        cl.addWidget(t)
+        self.pw = QLineEdit()
+        self.pw.setEchoMode(QLineEdit.Password)
+        self.pw.setPlaceholderText("Mot de passe")
+        self.pw.returnPressed.connect(self._try)
+        cl.addWidget(self.pw)
+        self.err = label("", "error")
+        self.err.setAlignment(Qt.AlignCenter)
+        cl.addWidget(self.err)
+        go = button("Déverrouiller", "primary", "lock", "#FFFFFF")
+        go.clicked.connect(self._try)
+        cl.addWidget(go)
+        lay.addWidget(card)
+        self.hide()
+
+    def lock(self) -> None:
+        self.setGeometry(self.parentWidget().rect())
+        self.pw.clear()
+        self.err.setText("")
+        self.show()
+        self.raise_()
+        self.pw.setFocus()
+
+    def _try(self) -> None:
+        try:
+            Keystore.unlock(self.ks, self.pw.text())
+        except InvalidPassword:
+            self.err.setText("Mot de passe incorrect")
+            self.pw.selectAll()
+            return
+        self.hide()
+        self.unlocked.emit()
+
+
 class MainWindow(QWidget):
     logout = Signal(bool)
     closed = Signal()
+    theme_changed = Signal(str, str)
 
     def __init__(self, profile: Profile, ctrl: UiController, tray_icon: QIcon | None = None):
         super().__init__()
@@ -107,6 +167,16 @@ class MainWindow(QWidget):
         for p in (self.chats, self.contacts, self.settings):
             self.stack.addWidget(p)
         self.toast = Toast(self)
+        self.lock_overlay = LockOverlay(self, profile.directory / "keystore.json")
+        self.updates = UpdateManager(self.engine, self)
+        self.settings.updates = self.updates
+        self.update_bar = self._build_update_bar(root)
+        self._auto_away_active = False
+        self.activity = ActivityMonitor(self.engine.settings.lock_minutes, self.engine.settings.auto_away_minutes, self)
+        self.activity.idle_lock.connect(self.lock_now)
+        self.activity.idle_away.connect(self._auto_away)
+        self.activity.back.connect(self._auto_back)
+        self._shortcuts()
         self._wire()
         self._setup_tray(tray_icon)
         self.goto(PAGE_CHATS)
@@ -161,6 +231,8 @@ class MainWindow(QWidget):
         self.contacts.add_contact.connect(self.add_contact)
         self.contacts.open_chat.connect(lambda cid: (self.goto(PAGE_CHATS), self.chats.open_conv(cid)))
         c.error.connect(lambda m: self.toast.show_message(m, "error", 5000))
+        self.settings.security_changed.connect(self.apply_security_settings)
+        self.settings.theme_changed.connect(lambda m, a: self.theme_changed.emit(m, a))
         c.info.connect(lambda m: self.toast.show_message(m, "ok"))
         self.settings.status_message.connect(lambda m, k: self.toast.show_message(m, k))
         self.settings.logout_requested.connect(self.logout)
@@ -186,6 +258,100 @@ class MainWindow(QWidget):
         self.tray.setToolTip("LDC P2P")
         self.tray.show()
 
+    # -- mise à jour -----------------------------------------------------------------------------------
+    def _build_update_bar(self, root) -> QWidget:
+        bar = GlassPanel(self.bg, radius=16, strong=True)
+        bar.setFixedHeight(48)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(16, 6, 10, 6)
+        self.update_lbl = label("")
+        self.update_btn = button("Mettre à jour et redémarrer", "primary", "download", "#FFFFFF")
+        later = button("Plus tard", "ghost")
+        h.addWidget(self.update_lbl, 1)
+        h.addWidget(self.update_btn)
+        h.addWidget(later)
+        bar.hide()
+        later.clicked.connect(bar.hide)
+        self.update_btn.clicked.connect(lambda: (self.update_btn.setEnabled(False), asyncio.ensure_future(self.updates.apply())))
+        self.updates.available.connect(self._show_update)
+        self.updates.status.connect(lambda m, k: self.toast.show_message(m, k, 4500))
+        self.updates.ready_to_restart.connect(self._restart_after_update)
+        return bar
+
+    def _show_update(self, up) -> None:
+        self.update_lbl.setText(f"Nouvelle version {up.version} disponible")
+        self.update_btn.setEnabled(True)
+        self._place_update_bar()
+        self.update_bar.show()
+        self.update_bar.raise_()
+
+    def _place_update_bar(self) -> None:
+        w = min(self.bg.width() - 120, 720)
+        self.update_bar.setGeometry((self.bg.width() - w) // 2, 10, w, 48)
+
+    def _restart_after_update(self) -> None:
+        QTimer.singleShot(1500, lambda: (UpdateManager.relaunch(), setattr(self, "_really_quit", True), self.close()))
+
+    # -- verrouillage, absence, raccourcis ----------------------------------------------------------------
+    def lock_now(self) -> None:
+        self.lock_overlay.lock()
+
+    def _auto_away(self) -> None:
+        if self.engine.settings.status == "online":
+            self._auto_away_active = True
+            self.ctrl.run(self.engine.set_status("away"))
+            self.me_avatar.dot.set_status("away")
+
+    def _auto_back(self) -> None:
+        if self._auto_away_active and self.engine.settings.status == "away":
+            self.ctrl.run(self.engine.set_status("online"))
+            self.me_avatar.dot.set_status("online")
+        self._auto_away_active = False
+
+    def apply_security_settings(self) -> None:
+        s = self.engine.settings
+        self.activity.lock_minutes, self.activity.away_minutes = s.lock_minutes, s.auto_away_minutes
+        self._apply_capture_protection()
+
+    def _apply_capture_protection(self) -> None:
+        winint.set_capture_protection(int(self.winId()), self.engine.settings.capture_protection)
+
+    def _shortcuts(self) -> None:
+        def sc(keys: str, fn) -> None:
+            QShortcut(QKeySequence(keys), self, activated=fn)
+        sc("Ctrl+K", lambda: (self.goto(PAGE_CHATS), self.chats.search.setFocus(), self.chats.search.selectAll()))
+        sc("Ctrl+N", self.add_contact)
+        sc("Ctrl+L", self.lock_now)
+        sc("Ctrl+1", lambda: self.goto(PAGE_CHATS))
+        sc("Ctrl+2", lambda: self.goto(PAGE_CONTACTS))
+        sc("Ctrl+3", lambda: self.goto(PAGE_SETTINGS))
+        sc("Alt+Down", lambda: self._step_conv(1))
+        sc("Alt+Up", lambda: self._step_conv(-1))
+        sc("Ctrl+Tab", lambda: self._step_conv(1))
+        sc("Ctrl+Shift+Tab", lambda: self._step_conv(-1))
+        sc("Esc", self._escape)
+
+    def _step_conv(self, d: int) -> None:
+        items = [i for i in self.chats.list.model_.items if not i.get("result")]
+        if not items:
+            return
+        idx = next((k for k, i in enumerate(items) if i["conv"] == self.chats.conv), -1)
+        self.goto(PAGE_CHATS)
+        self.chats.open_conv(items[(idx + d) % len(items)]["conv"])
+
+    def _escape(self) -> None:
+        c = self.chats
+        if self.stack.currentIndex() != PAGE_CHATS:
+            return
+        if c.composer.mode:
+            c.composer._cancel_banner()
+        elif c.search.text():
+            c.search.clear()
+        elif c.details_open:
+            c.toggle_details()
+        else:
+            c.view.clear_selection()
+
     # -- navigation ---------------------------------------------------------------------------------
     def goto(self, page: int) -> None:
         self.stack.setCurrentIndex(page)
@@ -197,18 +363,37 @@ class MainWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
-    def add_contact(self) -> None:
+    def add_contact(self, prefill: str = "") -> None:
         e = self.engine
-        d = AddContactDialog(self, e.my_card_code(), e.identity.name, e.me)
-        if d.exec() and d.code_value:
-            task = self.ctrl.run(e.add_contact_from_code(d.code_value, d.greeting_value), ok="Demande envoyée")
+        d = AddContactDialog(self, e.my_card_code(), e.identity.name, e.me, prefill if isinstance(prefill, str) else "")
+        if not (d.exec() and d.code_value):
+            return
+        from ..engine import EngineError
+        try:
+            pub, twins = e.preview_card(d.code_value)
+        except EngineError as ex:
+            self.toast.show_message(str(ex), "error", 5000)
+            return
+        if twins and not ConfirmDialog(self, "Un contact porte déjà ce nom",
+                                       f"« {pub.name} » ressemble à votre contact « {twins[0]['alias'] or twins[0]['name']} », mais l'identifiant est différent "
+                                       "(ce n'est donc PAS la même personne). Vérifiez auprès de lui avant de continuer.", "Ajouter quand même").exec():
+            return
+        connected = bool(e.relay and e.relay.connected)
+        ok_msg = "Demande envoyée" if connected else None
+        task = self.ctrl.run(e.add_contact_from_code(d.code_value, d.greeting_value), ok=ok_msg)
 
-            def done(t):
-                res = t.result() if not t.cancelled() and t.exception() is None else None
-                if res:
-                    self.goto(PAGE_CHATS)
-                    self.chats.open_conv(res["id"])
-            task.add_done_callback(done)
+        def done(t):
+            res = t.result() if not t.cancelled() and t.exception() is None else None
+            if res:
+                if not connected:
+                    self.toast.show_message("Demande enregistrée, mais vous n'êtes PAS connecté au serveur : elle partira dès la connexion (vérifiez Paramètres › Réseau).", "error", 8000)
+                self.goto(PAGE_CHATS)
+                self.chats.open_conv(res["id"])
+        task.add_done_callback(done)
+
+    def open_add_contact(self, code: str) -> None:
+        self.show_front()
+        self.add_contact(code)
 
     def new_group(self) -> None:
         cands = self.engine.contacts({"accepted"})
@@ -269,7 +454,8 @@ class MainWindow(QWidget):
         if not s.notifications or s.status == "dnd" or not self.tray:
             return False
         if self.engine.db.conv_settings(conv)["muted"]:
-            return False
+            m = self.engine.db.last_messages().get(conv)  # conversation muette : seules les mentions notifient
+            return bool(m and isinstance(m.get("extra"), dict) and self.engine.me in (m["extra"].get("men") or []))
         return not (self.isActiveWindow() and self.stack.currentIndex() == PAGE_CHATS and self.chats.conv == conv)
 
     def _on_message_notify(self, conv: str, mid: str, direction: str) -> None:
@@ -281,7 +467,9 @@ class MainWindow(QWidget):
         if not m:
             return
         self._last_notified_conv = conv
-        if e.settings.notification_previews:
+        if e.settings.sound:
+            sounds.play(e.settings.sound_name)
+        if e.settings.notification_previews and not self.lock_overlay.isVisible():
             title = e.display_name(m["sender"])
             body = (m["body"] or "")[:140] if m["kind"] == "text" else "Fichier : " + str((m.get("extra") or {}).get("name", ""))
         else:
@@ -303,11 +491,16 @@ class MainWindow(QWidget):
     # -- fenêtre --------------------------------------------------------------------------------------------
     def showEvent(self, e) -> None:
         super().showEvent(e)
+        self._apply_capture_protection()
         if self.use_backdrop:
             apply_windows_backdrop(self)
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
+        if self.lock_overlay.isVisible():
+            self.lock_overlay.setGeometry(self.rect())
+        if self.update_bar.isVisible():
+            self._place_update_bar()
         if self.toast.isVisible():
             self.toast.move((self.width() - self.toast.width()) // 2, self.height() - self.toast.height() - 28)
 

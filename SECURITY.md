@@ -14,6 +14,8 @@
 | Lecture de la base locale | Corps des messages et métadonnées de fichiers chiffrés (ChaCha20-Poly1305, clé dérivée de l'identité). |
 | Rejeu / doublons | Identifiant unique par message, table de déduplication, ré-acquittement idempotent. |
 | Spam / abus du relais | Authentification par signature, limite de débit, quotas de boîte aux lettres, limites de connexions, taille de paquet bornée avant allocation. |
+| Contacts aux noms ressemblants | Alerte à l'ajout et dans la liste : l'identifiant, lui, ne peut pas être imité. |
+| Chaîne de mise à jour | Manifeste signé Ed25519 + SHA-256, HTTPS, liste blanche de fichiers, sauvegarde et restauration (`docs/UPDATES.md`). |
 | Contenu malveillant à l'affichage | Texte distant échappé (seules des ancres http(s) sont créées) ; confirmation avant d'ouvrir un lien ; noms de fichiers assainis ; exécutables jamais lancés automatiquement. |
 | Écriture par un inconnu/bloqué | Rejeté avant tout traitement ; aucune notification d'échec envoyée à l'expéditeur. |
 
@@ -21,7 +23,7 @@
 
 1. **Pas de confidentialité persistante** : si une clé privée fuit, les messages interceptés dans le passé peuvent être lus. Un double ratchet est prévu (`docs/ROADMAP.md`).
 2. **Métadonnées visibles du relais** : identifiants LDC, adresses IP, qui écrit à qui, horaires, tailles (arrondies par blocs de 256 octets), liste de contacts surveillés pour la présence. Utilisez TLS et hébergez votre propre relais pour en limiter l'exposition.
-3. **Base locale partiellement en clair** : identifiants, horodatages, statuts et noms de contacts ne sont pas chiffrés (SQLCipher prévu).
+3. **Base locale partiellement en clair** : les noms/alias de contacts, noms de groupes et listes de membres sont désormais chiffrés ; restent en clair identifiants, horodatages, statuts et tailles (SQLCipher non intégré).
 4. **Pas d'anti-malware, pas de protection si l'ordinateur est compromis** (enregistreur de frappe, etc.).
 5. **Le propriétaire d'un groupe fait autorité** sur ses membres ; un groupe n'a pas d'administration partagée.
 6. **Une seule session active par identité** (la seconde connexion remplace la première).

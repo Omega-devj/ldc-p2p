@@ -22,7 +22,14 @@ class EngineSettings:
     status: str = "online"
     download_dir: str = ""
     auto_accept_mb: int = 0               # 0 = toujours demander
-    update_url: str = ""                 # base HTTPS des manifestes de mise à jour (vide = désactivé)
+    update_url: str = "https://github.com/Omega-devj/ldc-p2p/releases/latest/download"   # manifestes signés
+    auto_update: int = 1                  # 0 = jamais, 1 = prévenir, 2 = installer automatiquement
+    server_token: str = ""               # jeton d'accès si le serveur est privé
+    lock_minutes: int = 0                 # verrouillage automatique (0 = jamais)
+    auto_away_minutes: int = 5            # « Absent » automatique (0 = jamais)
+    sound: bool = True
+    sound_name: str = "doux"
+    capture_protection: bool = False      # exclut la fenêtre des captures d'écran (Windows)
     close_to_tray: bool = False
     backdrop: bool = False                # flou Mica/Acrylique Windows 11 (expérimental)
 

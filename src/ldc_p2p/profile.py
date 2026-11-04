@@ -112,3 +112,19 @@ def import_backup(db: Database, identity: Identity, path: Path, passphrase: str)
         if db.get_setting(k) is None:
             db.set_setting(k, v)
     return {"contacts": added, "groups": groups}
+
+
+def export_history(db: Database, identity: Identity, path: Path, passphrase: str, names: dict[str, str] | None = None,
+                   scrypt_n: int = SCRYPT_N) -> int:
+    """Exporte tout l'historique (texte + noms de fichiers) dans un fichier chiffré par phrase secrète."""
+    if len(passphrase) < 8:
+        raise ValueError("La phrase secrète doit contenir au moins 8 caractères")
+    out = []
+    for r in db.conn.execute("SELECT mid FROM messages WHERE kind IN ('text','file') ORDER BY ts, id").fetchall():
+        m = db.get_message(r["mid"])
+        out.append({"conv": m["conv"], "sender": m["sender"], "ts": m["ts"], "direction": m["direction"], "kind": m["kind"],
+                    "text": m["body"], "file": (m["extra"] or {}).get("name") if isinstance(m["extra"], dict) and m["kind"] == "file" else None})
+    blob = seal_blob(passphrase, json.dumps({"id": identity.id, "names": names or {}, "messages": out}).encode(),
+                     b"ldc-history-v1|" + identity.id.encode(), scrypt_n)
+    atomic_write(path, json.dumps({"format": "ldc-history", "version": 1, "id": identity.id, **blob}).encode())
+    return len(out)

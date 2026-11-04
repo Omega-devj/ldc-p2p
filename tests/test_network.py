@@ -323,3 +323,53 @@ async def test_direct_link_detects_impostor_dialer():
     assert b.mgr.link_for(a.ident.id) is None
     w.close()
     await b.mgr.stop()
+
+
+async def test_private_server_token_allowlist_blocklist_and_status(tmp_path):
+    from ldc_p2p.network.errors import probe_server
+    allow = tmp_path / "allow.txt"
+    block = tmp_path / "block.txt"
+    ok_ident, other = Identity.generate("ok"), Identity.generate("other")
+    allow.write_text(f"# invités\n{ok_ident.id}\n")
+    srv = RelayServer("127.0.0.1", 0, access_token="secret", allow_file=str(allow), block_file=str(block), status_port=0)
+    await srv.start()
+    try:
+        good = RelayClient(ok_ident, "127.0.0.1", srv.port, token="secret")
+        no_token = RelayClient(ok_ident, "127.0.0.1", srv.port, backoff_max=0.2)
+        not_invited = RelayClient(other, "127.0.0.1", srv.port, token="secret", backoff_max=0.2)
+        for c in (good, no_token, not_invited):
+            c.start()
+        await wait_for(lambda: good.connected)
+        await asyncio.sleep(0.8)
+        assert not no_token.connected and not not_invited.connected
+        assert "refusé" in (no_token.last_error or "")
+        # sonde : jeton absent → message clair ; bon jeton → succès (identité jetable, donc refusée par la liste d'invités)
+        bad = await probe_server("127.0.0.1", srv.port)
+        assert not bad.ok and "privé" in bad.message
+        # statut : aucun identifiant ni contenu
+        r, w = await asyncio.open_connection("127.0.0.1", srv.status_port)
+        w.write(b"GET /status HTTP/1.0\r\n\r\n")
+        raw = await r.read()
+        assert b'"connections": 1' in raw.replace(b'":1', b'": 1') or b'"connections":1' in raw
+        assert ok_ident.id.encode() not in raw
+        w.close()
+        # adresse bloquée : connexion coupée sans réponse
+        block.write_text("127.0.0.1\n")
+        r2, w2 = await asyncio.open_connection("127.0.0.1", srv.port)
+        assert await r2.read() == b""
+        for c in (good, no_token, not_invited):
+            await c.stop()
+    finally:
+        await srv.stop()
+
+
+async def test_probe_explains_common_errors(server):
+    from ldc_p2p.network.errors import probe_server, explain_error
+    ok = await probe_server("127.0.0.1", server.port)
+    assert ok.ok and "réussie" in ok.message
+    tls_on_plain = await probe_server("127.0.0.1", server.port, tls=True)
+    assert not tls_on_plain.ok and "TLS" in tls_on_plain.message
+    closed = await probe_server("127.0.0.1", 1)
+    assert not closed.ok and "aucun serveur" in closed.message
+    assert not (await probe_server("", 9443)).ok
+    assert "introuvable" in explain_error("[Errno 11001] getaddrinfo failed")
