@@ -72,6 +72,7 @@ class ChatEngine:
         self.activity: deque = deque(maxlen=300)   # journal lisible (sans contenu de message)
         self.recv_count = 0
         self.reject_reasons: Counter = Counter()
+        self.request_results: dict[str, str] = {}   # contact -> 'delivered' | 'queued' (réponse du serveur à la dernière demande)
         self._selftests: dict[str, asyncio.Future] = {}
         self._init_extensions()
 
@@ -433,6 +434,9 @@ class ChatEngine:
                 self._fail_row(row, reason)
             return
         self.note(f"→ {kind} pour …{to_id[-6:]} : serveur = {status}")
+        if kind == "req":
+            self.request_results[to_id] = status
+            self.events.emit("contact_update", id=to_id)
         # accepté par un transport (direct, ou serveur qui a stocké/livré)
         if kind == "msg" and msg_mid:
             self._advance(msg_mid, to_id, "sent")

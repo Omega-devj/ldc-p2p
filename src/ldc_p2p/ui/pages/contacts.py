@@ -112,7 +112,11 @@ class ContactsPage(QWidget):
             for c in groups["pending_out"]:
                 cancel = button("Annuler", "ghost")
                 cancel.clicked.connect(lambda _=False, i=c["id"]: self.ctrl.run(e.cancel_request(i)))
-                st = {"sent": "demande remise au serveur — en attente de réponse",
+                res = e.request_results.get(c["id"])
+                sent_txt = ("demande reçue par son application — en attente de sa réponse" if res == "delivered" else
+                            "demande gardée par le serveur — il la recevra à sa prochaine connexion" if res in ("queued", "offline") else
+                            "demande remise au serveur — en attente de réponse")
+                st = {"sent": sent_txt,
                       "queued": "demande en cours d'envoi…",
                       "offline": "⚠ demande en attente : vous n'êtes pas connecté au serveur"}[e.request_status(c["id"])]
                 self.rows.addWidget(self._row(c, [cancel], st + " · " + c["id"]))

@@ -262,6 +262,7 @@ class RelayServer:
             await old.send({"t": "bye", "reason": "replaced"}, 2)
             old.close()
         queued = self.mailbox.count(ldc_id)
+        log.info("✓ client connecté …%s (depuis %s, %d message(s) en attente)", ldc_id[-6:], ip, queued)
         await sess.send({"t": "ready", "observed_ip": ip, "queued": queued}, self.limits.send_timeout)
         asyncio.create_task(self._flush(sess), name="mailbox-flush")
         await self._notify_presence(ldc_id)
@@ -270,6 +271,7 @@ class RelayServer:
     async def _drop(self, sess: Session) -> None:
         sess.close()
         if self.sessions.get(sess.id) is sess:
+            log.info("✗ client déconnecté …%s", sess.id[-6:])
             del self.sessions[sess.id]
             for target in sess.watching:
                 self.watchers[target].discard(sess.id)
@@ -335,6 +337,12 @@ class RelayServer:
 
     async def _relay(self, s: Session, msg: dict) -> None:
         ack = {"t": "relay_ack", "mid": msg.get("mid") if isinstance(msg.get("mid"), str) else None}
+        to_short = str(msg.get("to", "?"))[-6:]
+
+        async def reply(a_: dict, status: str, reason: str | None = None) -> None:
+            kind = (msg.get("env") or {}).get("k") if isinstance(msg.get("env"), dict) else "?"
+            log.info("→ %s …%s → …%s : %s%s", "demande" if kind == "r" else "message", s.id[-6:], to_short, status, f" ({reason})" if reason else "")
+            await self._ack(s, a_, status, reason)
         env = msg.get("env")
         try:
             validate_envelope(env)
@@ -342,25 +350,25 @@ class RelayServer:
             if env["from"] != s.id or env["to"] != to or not ID_RE.match(to):
                 raise EnvelopeError("routage invalide")
         except (EnvelopeError, TypeError):
-            return await self._ack(s, ack, "rejected", "invalid")
+            return await reply(ack, "rejected", "invalid")
         ack["mid"] = env["id"]
         if not self._allow(s):
-            return await self._ack(s, ack, "rejected", "rate")
+            return await reply(ack, "rejected", "rate")
         ephemeral = bool(msg.get("ephemeral"))
         target = self.sessions.get(to)
         online = bool(target and not target.closed)
         if ephemeral:
             if online and await target.send({"t": "deliver", "env": env}, self.limits.send_timeout):
-                return await self._ack(s, ack, "delivered")
-            return await self._ack(s, ack, "offline")
+                return await reply(ack, "delivered")
+            return await reply(ack, "offline")
         env_json = _dumps(env)
         self.stats["relayed"] += 1
         stored = self.mailbox.put(to, env["id"], env_json)
         if stored == "full":
-            return await self._ack(s, ack, "rejected", "mailbox_full")
+            return await reply(ack, "rejected", "mailbox_full")
         if online and stored == "new" and await target.send({"t": "deliver", "env": env}, self.limits.send_timeout):
-            return await self._ack(s, ack, "delivered")
-        await self._ack(s, ack, "queued" if not online or stored == "dup" else "queued")
+            return await reply(ack, "delivered")
+        await reply(ack, "queued" if not online or stored == "dup" else "queued")
 
     async def _ack(self, s: Session, ack: dict, status: str, reason: str | None = None) -> None:
         ack["status"] = status

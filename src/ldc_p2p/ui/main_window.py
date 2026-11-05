@@ -449,12 +449,25 @@ class MainWindow(QWidget):
                                        "(ce n'est donc PAS la même personne). Vérifiez auprès de lui avant de continuer.", "Ajouter quand même").exec():
             return
         connected = bool(e.relay and e.relay.connected)
-        ok_msg = "Demande envoyée" if connected else None
-        task = self.ctrl.run(e.add_contact_from_code(d.code_value, d.greeting_value), ok=ok_msg)
+        task = self.ctrl.run(e.add_contact_from_code(d.code_value, d.greeting_value))
+
+        async def report(cid: str) -> None:
+            for _ in range(60):  # jusqu'à 6 s : on attend la réponse RÉELLE du serveur
+                if e.request_results.get(cid):
+                    break
+                await asyncio.sleep(0.1)
+            res = e.request_results.get(cid)
+            if res == "delivered":
+                self.toast.show_message("✓ Demande reçue par l'application de votre contact", "ok", 6000)
+            elif res in ("queued", "offline"):
+                self.toast.show_message("✓ Demande reçue par le serveur : elle sera remise dès que votre contact se connecte", "ok", 7000)
+            else:
+                self.toast.show_message("✗ Le serveur n'a PAS confirmé la demande. Ouvrez le diagnostic (icône Wi-Fi).", "error", 9000)
 
         def done(t):
             res = t.result() if not t.cancelled() and t.exception() is None else None
             if res:
+                asyncio.ensure_future(report(res["id"]))
                 if not connected:
                     self.toast.show_message("Demande enregistrée, mais vous n'êtes PAS connecté au serveur : elle partira dès la connexion (vérifiez Paramètres › Réseau).", "error", 8000)
                 self.goto(PAGE_CHATS)
