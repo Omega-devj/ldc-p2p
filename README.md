@@ -69,3 +69,4 @@ tests/       tests unitaires/intégration + ui_smoke.py
 packaging/   PyInstaller, Inno Setup, build_windows.ps1
 deploy/      Dockerfile, docker-compose, unité systemd du relais
 ```
+ldc1:eyJiayI6InJQOFNPK1drREpNZ1BCdU5FSlVYcHpacU9haS8wWjR4ZGxWeUJoQ1FWZzQ9IiwiaWQiOiJMREMtUkNTSkJZLURMQktUTy1WRjROT0MtU0M1WUZKIiwibmFtZSI6Ik9kemlnb24iLCJydiI6IjEyNy4wLjAuMTo5NDQzIiwic2lnIjoiODRraUl6K1dDZ3Q3bVc2M3pKMGxaNUd4S1FnYVdnUlVPZ2ptKzVaOTVsYkdtOG1WSENxckMvdmt4a0ExdXhBVkVJNFhqWDhYSW1HWjN0UEYxMmtRQ2c9PSIsInNrIjoiczRzMnBJcGdKU0p1SmNHdGYxRWNjZ05iWEh0V2JnNGxVM3Jid1oxOVFLRT0iLCJ2IjoxfQ
