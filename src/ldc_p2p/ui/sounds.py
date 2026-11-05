@@ -12,6 +12,7 @@ SOUNDS = {
     "doux": [(660, 0.09), (880, 0.14)],
     "cristal": [(1175, 0.06), (1568, 0.06), (2093, 0.12)],
     "classique": [(880, 0.12), (0, 0.04), (880, 0.12)],
+    "sonnerie": [(523, 0.18), (659, 0.18), (784, 0.30), (0, 0.5)],
 }
 LABELS = {"doux": "Doux", "cristal": "Cristal", "classique": "Classique"}
 _dir: Path | None = None

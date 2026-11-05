@@ -25,6 +25,9 @@ class UiController(QObject):
     connection = Signal(str, dict)
     file_state = Signal(str, str)
     file_progress = Signal(str, int, int)
+    call_state = Signal(object)
+    call_quality = Signal(object, object)
+    missed_call = Signal(str)
     error = Signal(str)
     info = Signal(str)
 
@@ -44,6 +47,9 @@ class UiController(QObject):
         ev.on("connection_state", lambda state, info: self.connection.emit(state, info or {}))
         ev.on("file_state", lambda mid, state: self.file_state.emit(mid, state))
         ev.on("file_progress", lambda mid, done, total: self.file_progress.emit(mid, done, total))
+        ev.on("call_state", lambda call: self.call_state.emit(call))
+        ev.on("call_quality", lambda call, stats: self.call_quality.emit(call, stats))
+        ev.on("missed_call", lambda peer: self.missed_call.emit(peer))
 
     def run(self, coro: Awaitable, ok: str | None = None, on_success=None) -> asyncio.Task:
         """Lance une coroutine du moteur ; les EngineError deviennent des messages lisibles."""

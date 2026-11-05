@@ -17,6 +17,8 @@ from ..crypto.identity import InvalidPassword, Keystore
 from . import sounds, winint
 from .activity import ActivityMonitor
 from .update_manager import UpdateManager
+from .call_window import CallWindow, IncomingCallPopup
+from .call_setup import install_call_components
 from .dialogs import AddContactDialog, ConfirmDialog, DiagnosticsDialog, NewGroupDialog, button
 from .pages.chats import ChatsPage
 from .pages.contacts import ContactsPage
@@ -176,6 +178,12 @@ class MainWindow(QWidget):
         self.activity.idle_lock.connect(self.lock_now)
         self.activity.idle_away.connect(self._auto_away)
         self.activity.back.connect(self._auto_back)
+        self.call_win: CallWindow | None = None
+        self.incoming: IncomingCallPopup | None = None
+        self.ctrl.call_state.connect(self._on_call_state)
+        self.ctrl.call_quality.connect(lambda call, st: self.call_win and self.call_win.set_quality(call.quality))
+        self.ctrl.missed_call.connect(lambda peer: self.toast.show_message(f"Appel manqué de {self.engine.display_name(peer)}", "error", 6000))
+        self.chats.call_requested.connect(self.request_call)
         self._shortcuts()
         self._wire()
         self._setup_tray(tray_icon)
@@ -257,6 +265,68 @@ class MainWindow(QWidget):
         self.tray.messageClicked.connect(self._open_notified)
         self.tray.setToolTip("LDC P2P")
         self.tray.show()
+
+    # -- appels ------------------------------------------------------------------------------------------
+    def request_call(self, conv: str, video: bool) -> None:
+        from ..engine.calls import calls_available
+        if not calls_available():
+            if ConfirmDialog(self, "Composants d'appel manquants",
+                             "Les appels utilisent des composants supplémentaires (WebRTC, audio, caméra ; environ 150 Mo). Les installer maintenant ?",
+                             "Installer").exec():
+                self.toast.show_message("Installation des composants d'appel… (quelques minutes)", "info", 8000)
+
+                async def run() -> None:
+                    ok, msg = await install_call_components()
+                    self.toast.show_message(msg, "ok" if ok else "error", 7000)
+                asyncio.ensure_future(run())
+            return
+        self.ctrl.run(self.engine.start_call(conv, video))
+
+    def _on_call_state(self, call) -> None:
+        e = self.engine
+        name = e.display_name(call.peer)
+        if call.state == "ended":
+            if self.incoming:
+                self.incoming.stop_ring()
+                self.incoming.close()
+                self.incoming = None
+            e.remote_video_sink = e.local_video_sink = None
+            win = self.call_win
+            if win:
+                win.set_state("ended", call.reason)
+                QTimer.singleShot(1400, win.close)
+                self.call_win = None
+            if call.reason and call.reason not in ("Appel refusé",):
+                self.toast.show_message(call.reason, "error", 5000)
+            return
+        if call.direction == "in" and call.state == "ringing":
+            self.incoming = IncomingCallPopup(name, call.peer, call.video)
+            self.incoming.accepted.connect(lambda v: self._accept_call(v))
+            self.incoming.declined.connect(lambda: self.ctrl.run(e.reject_call()))
+            geo = self.screen().availableGeometry()
+            self.incoming.move(geo.right() - 390, geo.top() + 40)
+            self.incoming.show()
+            if self.tray and e.settings.notifications:
+                self.tray.showMessage("LDC P2P", f"Appel {'vidéo ' if call.video else ''}entrant" + (f" de {name}" if e.settings.notification_previews else ""),
+                                      QSystemTrayIcon.NoIcon, 8000)
+            return
+        if self.incoming:
+            self.incoming.stop_ring()
+            self.incoming.close()
+            self.incoming = None
+        if self.call_win is None:
+            w = CallWindow(name, call.peer, call.video)
+            w.hangup_clicked.connect(lambda: self.ctrl.run(e.hangup()))
+            w.mute_toggled.connect(e.set_call_muted)
+            w.camera_toggled.connect(e.set_call_camera)
+            e.remote_video_sink, e.local_video_sink = w.view.set_remote, w.view.set_local
+            self.call_win = w
+            w.show()
+            w.raise_()
+        self.call_win.set_state(call.state, "")
+
+    def _accept_call(self, video: bool) -> None:
+        self.ctrl.run(self.engine.accept_call(video))
 
     # -- mise à jour -----------------------------------------------------------------------------------
     def _build_update_bar(self, root) -> QWidget:
@@ -460,6 +530,11 @@ class MainWindow(QWidget):
 
     def _on_message_notify(self, conv: str, mid: str, direction: str) -> None:
         self.update_badges()
+        if direction == "in" and not (self.isActiveWindow() and self.stack.currentIndex() == PAGE_CHATS and self.chats.conv == conv) \
+                and not self.engine.db.conv_settings(conv)["muted"] and self.engine.settings.status != "dnd":
+            m0 = self.engine.db.get_message(mid)
+            if m0 and m0["kind"] != "system":  # bandeau interne : fonctionne même si les notifications Windows sont désactivées
+                self.toast.show_message(f"Nouveau message de {self.engine.display_name(m0['sender'])}", "info", 4000)
         if direction != "in" or not self._should_notify(conv):
             return
         e = self.engine
@@ -478,6 +553,11 @@ class MainWindow(QWidget):
 
     def _on_request_notify(self, cid: str) -> None:
         self.update_badges()
+        c = self.engine.db.get_contact(cid)
+        who = c["name"] if c else "Quelqu'un"
+        self.toast.show_message(f"Nouvelle demande de contact de {who} — ouvrez l'onglet Contacts", "info", 8000)  # toujours visible dans l'application
+        if self.engine.settings.sound and self.engine.settings.status != "dnd":
+            sounds.play(self.engine.settings.sound_name)
         if self.engine.settings.notifications and self.engine.settings.status != "dnd" and self.tray:
             self._last_notified_conv = cid
             self.tray.showMessage("LDC P2P", "Nouvelle demande de contact", QSystemTrayIcon.NoIcon, 6000)

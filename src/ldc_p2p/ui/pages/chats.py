@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 import tempfile
-from PySide6.QtCore import QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton,
                                QScrollArea, QStackedWidget, QVBoxLayout, QWidget)
@@ -25,6 +25,8 @@ TTL_CHOICES = [("Désactivés", 0), ("5 minutes", 300), ("1 heure", 3600), ("24 
 
 
 class ChatsPage(QWidget):
+    call_requested = Signal(str, bool)
+
     def __init__(self, ctrl: UiController, parent=None):
         super().__init__(parent)
         self.ctrl, self.engine = ctrl, ctrl.engine
@@ -227,6 +229,12 @@ class ChatsPage(QWidget):
         self.h_lock.setPixmap(icons.pixmap("lock", "#34D399", 16))
         self.h_lock.setToolTip("Chiffrement de bout en bout")
         hl.addWidget(self.h_lock)
+        self.btn_call = self._tool("phone", "Appel vocal")
+        self.btn_vcall = self._tool("video", "Appel vidéo")
+        self.btn_call.clicked.connect(lambda: self.conv and self.call_requested.emit(self.conv, False))
+        self.btn_vcall.clicked.connect(lambda: self.conv and self.call_requested.emit(self.conv, True))
+        hl.addWidget(self.btn_call)
+        hl.addWidget(self.btn_vcall)
         self.btn_find = self._tool("search", "Rechercher dans les messages")
         self.btn_details = self._tool("panel", "Détails de la conversation")
         hl.addWidget(self.btn_find)
@@ -389,6 +397,12 @@ class ChatsPage(QWidget):
         else:
             self.h_sub.setText("En attente d'acceptation")
         self.h_lock.setVisible(s["state"] == "accepted")
+        can_call = s["kind"] == "dm" and s["state"] == "accepted" and self.engine.settings.calls_enabled
+        online = s.get("presence", "offline") != "offline"
+        for b, txt in ((self.btn_call, "Appel vocal"), (self.btn_vcall, "Appel vidéo")):
+            b.setVisible(can_call)
+            b.setEnabled(online)
+            b.setToolTip(txt if online else txt + " (contact hors ligne)")
 
     def _configure_composer(self, s: dict) -> None:
         if s["state"] == "pending_in":
@@ -723,6 +737,10 @@ class ChatsPage(QWidget):
             rn = button("Renommer", "", "edit")
             rn.clicked.connect(lambda: self._rename_contact(s["conv"], s["title"]))
             L.addWidget(rn)
+            dc = button("Connexion directe manuelle…", "", "link")
+            dc.setToolTip("Sans serveur : saisissez l'adresse IP (réseau local, VPN, IPv6) de ce contact")
+            dc.clicked.connect(lambda: self._manual_direct(s["conv"]))
+            L.addWidget(dc)
         else:
             self._group_details(s)
         L.addSpacing(6)
@@ -785,6 +803,17 @@ class ChatsPage(QWidget):
         if dlg.verified_value != bool(c["verified"]):
             e.set_verified(cid, dlg.verified_value)
         self._on_conv_changed(cid)
+
+    def _manual_direct(self, cid: str) -> None:
+        d = TextPrompt(self, "Connexion directe", "Adresse du contact, par exemple 192.168.1.20 ou 192.168.1.20:48123. "
+                       "Le contact doit avoir LDC P2P ouvert et vous avoir accepté ; la connexion est authentifiée par vos clés.", "", "adresse[:port]")
+        if not d.exec() or not d.value:
+            return
+        host, _, port = d.value.rpartition(":") if d.value.count(":") == 1 else (d.value, "", "")
+        host = host or d.value
+        task = self.ctrl.run(self.engine.connect_direct_manual(cid, host, int(port) if port.isdigit() else 0))
+        task.add_done_callback(lambda t: self.ctrl.info.emit("Connexion directe établie") if (not t.cancelled() and t.exception() is None and t.result())
+                               else self.ctrl.error.emit("Connexion directe impossible (adresse, port ou pare-feu)."))
 
     def _rename_contact(self, cid: str, current: str) -> None:
         d = TextPrompt(self, "Renommer le contact", "Ce nom n'est visible que par vous.", current)

@@ -7,5 +7,6 @@ if not exist .venv (
   python -m venv .venv || (pause & exit /b 1)
 )
 .venv\Scripts\python -m pip install --quiet --disable-pip-version-check -r requirements.txt || (echo Echec de l'installation & pause & exit /b 1)
+.venv\Scripts\python -m pip install --quiet --disable-pip-version-check -r requirements-calls.txt || echo (Composants d'appel non installes : les appels seront indisponibles, le reste fonctionne.)
 set PYTHONPATH=%~dp0src
 start "" .venv\Scripts\pythonw.exe -m ldc_p2p %*

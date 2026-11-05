@@ -60,3 +60,13 @@ async def test_request_survives_server_restart(make_node):
         await wait_for(lambda: b.engine.db.get_contact(a.identity.id) is not None, 20)
     finally:
         await srv2.stop()
+
+
+async def test_self_test_round_trip_and_activity_log(make_node, server):
+    a, b = await make_node("alice", server.port), await make_node("bob", server.port)
+    await a.online(), await b.online()
+    res = await a.engine.self_test()
+    assert res.startswith("✓"), res
+    await a.engine.add_contact_from_code(b.engine.my_card_code(), "hello")
+    await wait_for(lambda: any("demande de contact reçue" in t for _, t in b.engine.activity), 8)
+    assert any("serveur = " in t for _, t in a.engine.activity)

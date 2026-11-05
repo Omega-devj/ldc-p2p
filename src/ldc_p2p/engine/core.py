@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,21 @@ class ChatEngine:
         self._wake = asyncio.Event()
         self._stopping = False
         self._deferred: dict[str, list[dict]] = {}
+        self.activity: deque = deque(maxlen=300)   # journal lisible (sans contenu de message)
+        self.recv_count = 0
+        self.reject_reasons: Counter = Counter()
+        self._selftests: dict[str, asyncio.Future] = {}
         self._init_extensions()
+
+    def note(self, text: str) -> None:
+        """Entrée du journal d'activité (affichée dans le diagnostic ; jamais de contenu de message)."""
+        self.activity.append((time.time(), text))
+        log.info(text)
+
+    def _reject(self, reason: str) -> bool:
+        self.reject_reasons[reason] += 1
+        self.note(f"← enveloppe ignorée : {reason}")
+        return True
 
     def _init_extensions(self) -> None:  # surchargé par les mixins
         pass
@@ -94,6 +109,7 @@ class ChatEngine:
         s = self.settings
         if s.direct_enabled:
             await self._start_direct()
+            await self._start_lan()
         if s.server_host:
             self.relay = RelayClient(self.identity, s.server_host, s.server_port, tls=s.server_tls,
                                      visible=s.status != "invisible", token=s.server_token, on_deliver=self._on_relay_env,
@@ -106,6 +122,33 @@ class ChatEngine:
 
     def _resume_extensions(self) -> None:
         pass
+
+    async def _start_lan(self) -> None:
+        """Découverte des contacts sur le réseau local, sans aucun serveur."""
+        self.lan = None
+        if not (self.settings.lan_discovery and self.direct):
+            return
+        from ..network.lan import LanDiscovery
+        try:
+            self.lan = LanDiscovery(self.me, self.direct.port, lambda: [c["id"] for c in self.db.list_contacts({"accepted"})], self._on_lan_peer)
+            await self.lan.start()
+        except OSError as e:
+            log.info("Découverte réseau local indisponible: %s", e)
+            self.lan = None
+
+    def _on_lan_peer(self, cid: str, host: str, port: int) -> None:
+        if self.direct and not self.direct.link_for(cid) and self._candidate_allowed(host):
+            self.note(f"réseau local : contact …{cid[-6:]} trouvé à {host}")
+            self.spawn(self._try_direct(cid, [[host, port]]), "lan-direct")
+
+    async def connect_direct_manual(self, contact_id: str, host: str, port: int = 0) -> bool:
+        """Connexion directe sans serveur ni découverte : adresse saisie à la main (VPN, IPv6, port redirigé)."""
+        pub = self._link_lookup(contact_id)
+        if not self.direct or pub is None:
+            raise EngineError("Connexions directes désactivées ou contact inconnu.")
+        ok = await self.direct.connect(pub, [(host.strip(), port or self.direct.port)])
+        self.events.emit("presence", id=contact_id)
+        return ok
 
     async def _start_direct(self) -> None:
         s = self.settings
@@ -127,6 +170,9 @@ class ChatEngine:
                     self.spawn(self._on_contact_online(c["id"]), "contact-online")
         elif not enabled and self.direct is not None:
             d, self.direct = self.direct, None
+            if getattr(self, "lan", None):
+                await self.lan.stop()
+                self.lan = None
             await d.stop()
         self.events.emit("presence", id=None)
 
@@ -135,6 +181,8 @@ class ChatEngine:
         self._wake.set()
         if self.relay:
             await self.relay.stop()
+        if getattr(self, "lan", None):
+            await self.lan.stop()
         if self.direct:
             await self.direct.stop()
         for t in list(self._tasks):
@@ -369,6 +417,7 @@ class ChatEngine:
             status = await self._transmit(to_id, row["envelope"])
         except (ChannelUnavailable, ConnectionError, OSError) as e:
             attempts = row["attempts"] + 1
+            self.note(f"→ {kind} pour …{to_id[-6:]} NON envoyé ({e}) — nouvel essai dans {backoff_ms(attempts) // 1000} s")
             if age > MAX_AGE_MS:
                 self._fail_row(row, "délai dépassé")
             else:
@@ -383,6 +432,7 @@ class ChatEngine:
             else:
                 self._fail_row(row, reason)
             return
+        self.note(f"→ {kind} pour …{to_id[-6:]} : serveur = {status}")
         # accepté par un transport (direct, ou serveur qui a stocké/livré)
         if kind == "msg" and msg_mid:
             self._advance(msg_mid, to_id, "sent")
@@ -584,30 +634,42 @@ class ChatEngine:
         try:
             validate_envelope(env)
         except EnvelopeError:
-            return True
+            return self._reject("format invalide")
         if env["to"] != self.me:
-            return True
+            return self._reject("destinée à une autre identité")
         sender = env["from"]
+        self.recv_count += 1
+        self.note(f"← reçu ({'demande' if env['k'] == 'r' else 'message'}) de …{sender[-6:]} via {via}")
+        if sender == self.me:  # test aller-retour avec le serveur
+            try:
+                inner = open_envelope(env, self.identity, self.identity.public)
+                fut = self._selftests.pop(inner.get("n", ""), None) if inner.get("t") == "selftest" else None
+                if fut and not fut.done():
+                    fut.set_result(True)
+            except EnvelopeError:
+                pass
+            return True
         if env["k"] == "r":
             return self._handle_request(env)
         contact = self.db.get_contact(sender)
-        if contact is None or contact["state"] == "blocked":
-            return True
+        if contact is None:
+            return self._reject(f"expéditeur …{sender[-6:]} absent de vos contacts")
+        if contact["state"] == "blocked":
+            return self._reject("expéditeur bloqué")
         pub = self.pub_of(sender)
         if pub is None:
-            return True
+            return self._reject("clé du contact illisible")
         try:
             inner = open_envelope(env, self.identity, pub)
         except EnvelopeError as e:
-            log.info("Enveloppe rejetée (%s)", e)
-            return True
+            return self._reject(f"signature/déchiffrement refusé ({e})")
         t = inner["t"]
         state = contact["state"]
         allowed = {"accepted": None, "pending_out": {"req_ok"}, "group": {"msg", "ginv", "gleave", "typing", "ack", "read", "react"}}
         if state in allowed and allowed[state] is not None and t not in allowed[state]:
             return True
         if state == "pending_in":
-            return True
+            return self._reject("demande de contact pas encore acceptée")
         seen_key = f"{sender}:{env['id']}"
         if self.db.is_seen(seen_key):  # doublon : on ré-acquitte sans retraiter
             if t == "msg":
@@ -640,7 +702,7 @@ class ChatEngine:
         if existing:
             st = existing["state"]
             if st == "blocked":
-                return True
+                return self._reject("demande d'un contact bloqué")
             if st == "pending_out":
                 self.db.update_contact(pub.id, state="accepted")
                 self._pub_cache.pop(pub.id, None)
@@ -667,6 +729,7 @@ class ChatEngine:
         if greeting:
             self.db.add_message(mid=f"greet-{pub.id}-{env['id']}", conv=pub.id, sender=pub.id, direction="in",
                                 body=greeting, ts=now_ms(), status="received", kind="system")
+        self.note(f"✓ demande de contact reçue de « {pub.name} » (…{pub.id[-6:]})")
         self.events.emit("contact_request", id=pub.id)
         self.events.emit("contact_update", id=pub.id)
         return True
@@ -760,6 +823,7 @@ class ChatEngine:
 
     # ------------------------------------------------------------------ présence & connexions
     def _on_relay_state(self, state: str, info: dict) -> None:
+        self.note(f"serveur : {state}" + (f" ({info.get('error')})" if info.get("error") else ""))
         self.events.emit("connection_state", state=state, info=info)
         if state == "connected":
             self.db.outbox_wake_pending()
@@ -861,6 +925,28 @@ class ChatEngine:
                 if self.server_online.get(c["id"]) or self.is_direct(c["id"]):
                     await self._send_ctl(c["id"], {"t": "presence", "s": status}, ephemeral=True)
         self.events.emit("presence", id=None)
+
+    async def self_test(self, timeout: float = 6.0) -> str:
+        """Aller-retour complet : on s'envoie un message chiffré PAR LE SERVEUR et on vérifie qu'il revient."""
+        if not (self.relay and self.relay.connected):
+            return "✗ Vous n'êtes pas connecté au serveur (voir Paramètres › Réseau)."
+        n = new_mid()
+        env = seal(self.identity, self.identity.public, {"t": "selftest", "n": n})
+        fut = asyncio.get_running_loop().create_future()
+        self._selftests[n] = fut
+        t0 = time.monotonic()
+        try:
+            status = await self.relay.send_env(self.me, env, ephemeral=True)
+            if not status.startswith("delivered"):
+                return f"✗ Le serveur a répondu « {status} » (il ne vous remet pas vos propres messages)."
+            await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            return "✗ Le serveur a accepté le message mais il n'est jamais revenu : problème de réception côté application."
+        except Exception as e:
+            return f"✗ Échec : {e}"
+        finally:
+            self._selftests.pop(n, None)
+        return f"✓ Aller-retour réussi en {int((time.monotonic() - t0) * 1000)} ms : l'envoi ET la réception fonctionnent."
 
     # ------------------------------------------------------------------ maintenance
     async def _maintenance_loop(self) -> None:

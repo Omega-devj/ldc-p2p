@@ -318,22 +318,46 @@ class DiagnosticsDialog(GlassDialog):
     """Diagnostic réseau lisible : ce qui fonctionne, ce qui ne fonctionne pas, et pourquoi."""
 
     def __init__(self, parent, engine):
-        super().__init__(parent, "Diagnostic réseau", "État réel des connexions, sans jargon.", 600)
+        super().__init__(parent, "Diagnostic réseau", "État réel des connexions, sans jargon.", 640)
         self.engine = engine
         self.rows = QVBoxLayout()
         self.rows.setSpacing(8)
         holder = QWidget()
         holder.setLayout(self.rows)
         self.body.addWidget(holder)
+        self.selftest_lbl = label("", "muted", wrap=True)
+        self.body.addWidget(self.selftest_lbl)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFixedHeight(150)
+        self.log_view.setPlaceholderText("Journal d'activité (sans contenu de message)")
+        self.body.addWidget(label("ACTIVITÉ RÉCENTE", "section"))
+        self.body.addWidget(self.log_view)
         retry = button("Reconnecter", "", "refresh")
+        test = button("Test aller-retour", "", "wifi")
+        cplog = button("Copier le journal", "", "copy")
         close = button("Fermer", "primary")
         retry.clicked.connect(self._retry)
+        test.clicked.connect(self._selftest)
+        cplog.clicked.connect(lambda: copy_text(self.log_view.toPlainText()))
         close.clicked.connect(self.accept)
-        self.buttons(retry, close)
+        self.buttons(retry, test, cplog, close)
         self.refresh()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1500)
+
+    def _selftest(self) -> None:
+        import asyncio
+        self.selftest_lbl.setText("Test en cours…")
+
+        async def run() -> None:
+            res = await self.engine.self_test()
+            self.selftest_lbl.setText(res)
+            self.selftest_lbl.setProperty("role", "ok" if res.startswith("✓") else "error")
+            self.selftest_lbl.style().unpolish(self.selftest_lbl)
+            self.selftest_lbl.style().polish(self.selftest_lbl)
+        asyncio.ensure_future(run())
 
     def _retry(self) -> None:
         if self.engine.relay:
@@ -362,6 +386,10 @@ class DiagnosticsDialog(GlassDialog):
                 it.widget().deleteLater()
         e = self.engine
         s = e.settings
+        import time as _t
+        self.log_view.setPlainText("\n".join(f"{_t.strftime('%H:%M:%S', _t.localtime(ts))}  {txt}" for ts, txt in list(e.activity)[-60:]))
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+        self.rows.addWidget(self._row(None, "Votre identifiant", f"{e.me}  ·  reçus : {e.recv_count}  ·  ignorés : {sum(e.reject_reasons.values())}"))
         if not s.server_host:
             self.rows.addWidget(self._row(None, "Serveur de rendez-vous", "Aucun serveur configuré : seules les connexions directes sur le même réseau fonctionnent. Ajoutez un serveur dans Paramètres › Réseau."))
         elif e.relay and e.relay.connected:

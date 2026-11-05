@@ -30,6 +30,17 @@ class EngineSettings:
     sound: bool = True
     sound_name: str = "doux"
     capture_protection: bool = False      # exclut la fenêtre des captures d'écran (Windows)
+    calls_enabled: bool = True
+    call_mode: str = "auto"               # "auto" : STUN/TURN si configurés ; "local" : AUCUN serveur (réseau local uniquement)
+    stun_servers: str = "stun:stun.l.google.com:19302"
+    turn_url: str = ""
+    turn_user: str = ""
+    turn_pass: str = ""
+    hide_ip: bool = False                 # n'annonce que des candidats relais (TURN obligatoire)
+    audio_in: str = ""
+    audio_out: str = ""
+    camera: str = ""
+    lan_discovery: bool = True            # trouve les contacts du réseau local sans aucun serveur
     close_to_tray: bool = False
     backdrop: bool = False                # flou Mica/Acrylique Windows 11 (expérimental)
 

@@ -27,7 +27,7 @@ Messagerie **pair à pair hybride**, **chiffrée de bout en bout**, pour Windows
 | Thème clair/sombre, 6 couleurs d'accent, raccourcis clavier (Ctrl+K, Ctrl+N, Ctrl+L, Alt+↑/↓, Échap) | ✅ |
 | Serveur privé (jeton, liste d'invités, liste d'adresses bloquées), page de statut sans donnée personnelle, image Docker | ✅ testé |
 | **Mises à jour automatiques à chaque modification du dépôt GitHub** (releases signées) | ✅ écrit — voir `docs/UPDATES.md` |
-| **Appels vocaux / vidéo** | ❌ non développé (voir `docs/ROADMAP.md`) |
+| Appels vocaux et vidéo 1 à 1, avec serveurs (STUN/TURN) ou sans aucun serveur (réseau local, VPN, IPv6) ; découverte du réseau local | ✅ moteur et WebRTC testés en boucle locale ; micro/caméra réels et Windows non testés — `docs/CALLS.md` |
 | **Synchronisation multi-appareils** | ❌ non développé (une seule session active par identité) |
 | Confidentialité persistante (forward secrecy / double ratchet) | ❌ conception écrite : `docs/FORWARD_SECRECY_DESIGN.md` |
 | Audit de sécurité indépendant | ❌ impossible à automatiser : périmètre prêt dans `docs/AUDIT_SCOPE.md` |

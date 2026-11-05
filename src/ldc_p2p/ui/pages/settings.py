@@ -47,6 +47,7 @@ class SettingsPage(QWidget):
         self._account()
         self._appearance()
         self._network()
+        self._calls()
         self._security()
         self._privacy()
         self._notifications()
@@ -248,6 +249,100 @@ class SettingsPage(QWidget):
         snd.activated.connect(pick)
         self._switch(L, "Son de notification", "Joué à la réception d'un message (sauf « Ne pas déranger » et conversations muettes).", "sound")
         self._row(L, "Sonnerie", "", snd)
+
+    def _calls(self) -> None:
+        from PySide6.QtWidgets import QComboBox
+        from ...engine.calls import calls_available
+        from ..call_setup import install_call_components
+        e = self.engine
+        s = e.settings
+        L = self._card("Appels vocaux et vidéo")
+
+        def save() -> None:
+            e.settings.save(e.db)
+
+        self._switch(L, "Activer les appels", "Appels 1 à 1 avec vos contacts acceptés, chiffrés de bout en bout (WebRTC).", "calls_enabled")
+        ok = calls_available()
+        status = label("✓ Composants installés" if ok else "✗ Composants manquants (WebRTC, audio, caméra — environ 150 Mo)", "ok" if ok else "error")
+        inst = button("Installer", "primary", "download", "#FFFFFF")
+        inst.setVisible(not ok)
+
+        def do_install() -> None:
+            inst.setEnabled(False)
+            status.setText("Installation en cours… (quelques minutes)")
+
+            async def run() -> None:
+                good, msg = await install_call_components()
+                status.setText(("✓ " if good else "✗ ") + msg)
+                inst.setEnabled(not good)
+            asyncio.ensure_future(run())
+        inst.clicked.connect(do_install)
+        r = self._row(L, "Composants", "", status)
+        r.addWidget(inst)
+        mode = QComboBox()
+        mode.addItem("Automatique (serveurs STUN, TURN en secours)", "auto")
+        mode.addItem("Sans serveur (réseau local, VPN, IPv6 uniquement)", "local")
+        mode.setCurrentIndex(max(0, mode.findData(s.call_mode)))
+
+        def chg_mode(i: int) -> None:
+            s.call_mode = mode.itemData(i)
+            save()
+        mode.currentIndexChanged.connect(chg_mode)
+        self._row(L, "Chemin des appels", "« Sans serveur » n'utilise AUCUN serveur pour les médias : les deux personnes doivent pouvoir se joindre directement "
+                  "(même réseau local, VPN type Tailscale, IPv6 ou port redirigé).", mode)
+
+        def field(attr: str, ph: str, secret: bool = False) -> QLineEdit:
+            f = QLineEdit(getattr(s, attr))
+            f.setPlaceholderText(ph)
+            f.setMinimumWidth(300)
+            if secret:
+                f.setEchoMode(QLineEdit.Password)
+
+            def ed() -> None:
+                setattr(s, attr, f.text().strip())
+                save()
+            f.editingFinished.connect(ed)
+            return f
+        self._row(L, "Serveurs STUN", "Découvrent votre adresse publique (séparés par des virgules). Un STUN public voit votre adresse IP.", field("stun_servers", "stun:stun.l.google.com:19302"))
+        self._row(L, "Serveur TURN (secours)", "Relaie les médias chiffrés quand la connexion directe est impossible. À héberger vous-même (docs/CALLS.md).", field("turn_url", "turn:relais.exemple.fr:3478"))
+        self._row(L, "Identifiant TURN", "", field("turn_user", "utilisateur"))
+        self._row(L, "Mot de passe TURN", "", field("turn_pass", "mot de passe", True))
+        self._switch(L, "Masquer mon adresse IP", "N'annonce que l'adresse du serveur TURN (exige un TURN). Légèrement plus de latence.", "hide_ip")
+        self._switch(L, "Découverte sur le réseau local", "Retrouve vos contacts du même réseau sans aucun serveur (étiquette rotative, pas d'ID diffusé). Redémarrage nécessaire.", "lan_discovery")
+        det = button("Détecter les périphériques", "", "refresh")
+        mic, spk, cam = QComboBox(), QComboBox(), QComboBox()
+        for c, cur, ph in ((mic, s.audio_in, "Micro par défaut"), (spk, s.audio_out, "Haut-parleurs par défaut"), (cam, s.camera, "Caméra par défaut")):
+            c.addItem(ph, "")
+            if cur:
+                c.addItem(cur if not c is cam else f"Caméra {cur}", cur)
+                c.setCurrentIndex(1)
+
+        def pick(attr: str, combo) -> None:
+            setattr(s, attr, combo.currentData() or "")
+            save()
+        mic.currentIndexChanged.connect(lambda _: pick("audio_in", mic))
+        spk.currentIndexChanged.connect(lambda _: pick("audio_out", spk))
+        cam.currentIndexChanged.connect(lambda _: pick("camera", cam))
+
+        def detect() -> None:
+            from ...media.devices import list_audio_devices, list_cameras
+            ins, outs = list_audio_devices()
+            for combo, items, attr, ph, fmt in ((mic, ins, "audio_in", "Micro par défaut", "{}"), (spk, outs, "audio_out", "Haut-parleurs par défaut", "{}"),
+                                                (cam, list_cameras(), "camera", "Caméra par défaut", "Caméra {}")):
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem(ph, "")
+                for it in items:
+                    combo.addItem(fmt.format(it), it)
+                combo.setCurrentIndex(max(0, combo.findData(getattr(s, attr))))
+                combo.blockSignals(False)
+            self.status_message.emit(f"{len(ins)} micro(s), {len(outs)} sortie(s), {len(list_cameras())} caméra(s) détectés", "ok")
+        det.clicked.connect(detect)
+        self._row(L, "Micro", "", mic)
+        self._row(L, "Haut-parleurs", "", spk)
+        self._row(L, "Caméra", "", cam)
+        L.addWidget(det, 0, Qt.AlignRight)
+        L.addWidget(label("Conseil : utilisez un casque. L'annulation d'écho n'est pas incluse : sans casque, votre interlocuteur peut s'entendre en retour.", "faint", wrap=True))
 
     def _security(self) -> None:
         from PySide6.QtWidgets import QComboBox

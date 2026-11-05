@@ -1,0 +1,16 @@
+# Serveur TURN (relais média de secours) pour les appels LDC P2P — à héberger vous-même.
+# 1) Remplacez VOTRE-DOMAINE, VOTRE-IP-PUBLIQUE et le secret ; 2) ouvrez 3478 (UDP+TCP) et 49160-49200 (UDP) ;
+# 3) Dans LDC P2P : Paramètres › Appels › Serveur TURN = turn:VOTRE-DOMAINE:3478, identifiant/mot de passe ci-dessous.
+services:
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: host
+    command: >
+      -n --realm=VOTRE-DOMAINE --fingerprint --lt-cred-mech
+      --user=ldc:CHANGEZ-MOI-MOT-DE-PASSE-LONG
+      --external-ip=VOTRE-IP-PUBLIQUE
+      --min-port=49160 --max-port=49200
+      --no-multicast-peers --no-cli --no-tlsv1 --no-tlsv1_1
+      --denied-peer-ip=10.0.0.0-10.255.255.255 --denied-peer-ip=172.16.0.0-172.31.255.255 --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=127.0.0.0-127.255.255.255
